@@ -13,11 +13,25 @@ Single file, zero dependencies.
 On the Advanced Computer, run:
 
 ```
+wget https://raw.githubusercontent.com/EvodiAaron/spawner-orchestrator/main/install install
+install
+reboot
+```
+
+The `install` script deletes any existing `startup` and downloads the
+latest one. It fetches before it deletes, so a failed download never
+leaves the computer without a program.
+
+**Updating later:** just run `install` again, then `reboot`.
+
+If you'd rather skip the installer, a one-off manual fetch works too:
+
+```
 wget https://raw.githubusercontent.com/EvodiAaron/spawner-orchestrator/main/startup startup
 reboot
 ```
 
-> `wget` requires the server's ComputerCraft config to have HTTP enabled
+> Both require the server's ComputerCraft config to have HTTP enabled
 > (`http_enable = true`, the default on most packs). If it's disabled, copy
 > the file by hand into `saves/<world>/computercraft/computer/<id>/startup`.
 

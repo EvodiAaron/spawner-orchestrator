@@ -1,0 +1,62 @@
+-- =====================================================================
+-- installer / updater for the spawner control panel
+--
+-- fetches the latest "startup" from github, deletes the old copy and
+-- puts the new one in its place. safe to re-run any time: the download
+-- happens first, so a failed fetch never leaves the computer without
+-- a startup program.
+--
+-- usage (first time, on the computer):
+--   wget https://raw.githubusercontent.com/EvodiAaron/spawner-orchestrator/main/install install
+--   install
+-- afterwards just run "install" again to update, then "reboot".
+--
+-- requires http to be enabled in the server's computercraft config
+-- (http_enable = true, the default on most packs).
+-- =====================================================================
+
+local URL = "https://raw.githubusercontent.com/EvodiAaron/spawner-orchestrator/main/startup"
+local TARGET = "startup"
+local TMP = "startup.new"
+
+if not http then
+  print("http is disabled in the computercraft config;")
+  print("cannot download. copy the file in by hand instead.")
+  return
+end
+
+-- cache-busting query so raw.githubusercontent serves a fresh copy
+-- right after a push instead of a cached one
+print("downloading " .. TARGET .. " ...")
+local res = http.get(URL .. "?t=" .. tostring(os.clock()))
+if not res then
+  print("download failed - check the url and your")
+  print("server's http whitelist. nothing was changed.")
+  return
+end
+
+local body = res.readAll()
+res.close()
+
+-- sanity check: make sure we got the panel and not an error page
+if not body or #body == 0
+  or not string.find(body, "spawner control panel", 1, true) then
+  print("downloaded content does not look like the")
+  print("panel - aborting. nothing was changed.")
+  return
+end
+
+local h = fs.open(TMP, "w")
+if not h then
+  print("could not write " .. TMP .. " - aborting.")
+  return
+end
+h.write(body)
+h.close()
+
+-- the download is safely on disk; now delete the old copy and swap in
+if fs.exists(TARGET) then fs.delete(TARGET) end
+fs.move(TMP, TARGET)
+
+print("installed " .. TARGET .. " (" .. #body .. " bytes).")
+print("run \"reboot\" to start the panel.")
