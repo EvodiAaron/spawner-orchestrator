@@ -34,13 +34,15 @@
 --      integrator, pick the side that faces the spawner, and set
 --      "inverted" to match the spawner's own redstone mode
 --
--- controls (terminal): up/down select, space toggle, T turns the
---   selected spawner on for a preset duration (with a live countdown),
---   A (or S) opens settings, ctrl+t quits. in menus: enter selects,
---   backspace goes back. text entry: enter accepts, backspace on an
---   empty field cancels.
+-- controls (terminal): up/down select, space toggle, tab toggles all
+--   at once (master switch: anything on -> all off, else all on),
+--   T turns the selected spawner on for a preset duration (with a live
+--   countdown), A (or S) opens settings, ctrl+t quits. in menus: enter
+--   selects, backspace goes back. text entry: enter accepts, backspace
+--   on an empty field cancels.
 -- controls (advanced monitor): tap a row to toggle it, tap
---   [ Settings ] to configure on the terminal.
+--   [ Toggle All ] for the master switch. settings are terminal-only.
+--   the monitor picks the largest text scale that still fits the list.
 --
 -- config lives in "config" next to this program; a corrupt file is
 -- moved to "config.bak" and the panel starts fresh.
@@ -110,8 +112,9 @@ local tickTimerId = nil
 -- monitor state
 local mon, monName
 local monColor = false
+local monScale = 1
 local monRowMap = {} -- monitor y -> spawner index, rebuilt on every draw
-local monSettingsY = nil
+local monToggleAllY = nil
 
 local ui = {
   screen = "main", -- main|settings|edit|pick_target|pick_side|integrators|scan|confirm|input
@@ -330,6 +333,31 @@ local function scanForIntegrators()
   return found
 end
 
+-- pick the largest text scale where the layout still fits: at least 15
+-- columns for name + status, and enough rows for the list. converges
+-- because the character grid at scale 1 is a fixed property of the
+-- monitor's physical size
+local function updateMonitorScale()
+  if not mon then return end
+  local ok, w, h = pcall(mon.getSize)
+  if not ok or type(w) ~= "number" then return end
+  local w1 = w * monScale -- character grid the monitor would have at scale 1
+  local h1 = h * monScale
+  local n = config and #config.spawners or 0
+  local rowsNeeded = math.max(5, n + 3)
+  local s = 5
+  while s > 0.5 do
+    if math.floor(w1 / s) >= 15 and math.floor(h1 / s) >= rowsNeeded then
+      break
+    end
+    s = s - 0.5
+  end
+  if s ~= monScale then
+    monScale = s
+    pcall(mon.setTextScale, s)
+  end
+end
+
 local function findMonitor()
   local newMon, newName
   -- the filter callback only captures the peripheral's name, which is
@@ -350,12 +378,9 @@ local function findMonitor()
   if mon then
     local ok, c = pcall(mon.isColor)
     monColor = (ok and c) or false -- advanced monitors are the colour ones
-    pcall(function()
-      mon.setTextScale(1)
-      local mw = mon.getSize()
-      -- small monitors get a smaller text scale so rows still fit
-      if mw < 18 then mon.setTextScale(0.5) end
-    end)
+    monScale = 1
+    pcall(mon.setTextScale, 1)
+    updateMonitorScale()
   end
 end
 
@@ -412,7 +437,7 @@ end
 
 local function spawnerStatusText(sp)
   if sp.target == "none" then return "---", colors.lightGray end
-  if sp.state then return " ON", colors.lime end
+  if sp.state then return "ON", colors.lime end
   return "OFF", colors.red
 end
 
@@ -491,7 +516,8 @@ local function drawTermMain()
         if t.isColor() then t.setTextColor(colors.white) end
       end
       local text, col = spawnerStatusText(sp)
-      t.setCursorPos(w - 6, y)
+      -- right-align the bracket group so "]" always sits at w-2
+      t.setCursorPos(w - 3 - #text, y)
       t.write("[")
       if t.isColor() then t.setTextColor(col) end
       t.write(text)
@@ -521,8 +547,8 @@ local function drawTermMain()
     t.write(truncate(ui.status, w - 2))
   else
     if t.isColor() then t.setTextColor(colors.lightGray) end
-    local hint = "Up/Dn move  Space toggle  T timer  A settings"
-    if anyOffline then hint = "Space toggle  T timer  A settings  !=offline" end
+    local hint = "Space toggle  Tab all  T timer  A settings"
+    if anyOffline then hint = "Space toggle  Tab all  A settings  !=offline" end
     t.write(truncate(hint, w - 2))
   end
   if t.isColor() then t.setTextColor(colors.white) end
@@ -680,9 +706,10 @@ local function drawTerm()
 end
 
 local function drawMonitorRaw()
+  updateMonitorScale()
   local w, h = mon.getSize()
   monRowMap = {}
-  monSettingsY = nil
+  monToggleAllY = nil
   if monColor then
     mon.setTextColor(colors.white)
     mon.setBackgroundColor(colors.black)
@@ -706,9 +733,22 @@ local function drawMonitorRaw()
     end
     return
   end
-  mon.setCursorPos(2, 1)
-  mon.write(truncate("Spawners", w - 1))
-  local listH = math.max(1, h - 3)
+  -- heading: a full-width bar so it stands out from the list rows
+  local title = monColor and "SPAWNERS" or "= SPAWNERS ="
+  if monColor then
+    mon.setBackgroundColor(colors.blue)
+    mon.setTextColor(colors.white)
+  end
+  mon.setCursorPos(1, 1)
+  mon.clearLine()
+  mon.setCursorPos(math.max(1, math.floor((w - #title) / 2) + 1), 1)
+  mon.write(truncate(title, w))
+  if monColor then
+    mon.setBackgroundColor(colors.black)
+    mon.setTextColor(colors.white)
+  end
+  -- basic monitors have no touch, so no button row: the list gets the space
+  local listH = monColor and math.max(1, h - 3) or math.max(1, h - 1)
   local n = #config.spawners
   if n == 0 then
     mon.setCursorPos(2, 2)
@@ -738,7 +778,8 @@ local function drawMonitorRaw()
         if monColor then mon.setTextColor(colors.white) end
       end
       local text, col = spawnerStatusText(sp)
-      mon.setCursorPos(w - 5, y)
+      -- right-align the bracket group so "]" always sits at w-1
+      mon.setCursorPos(w - 2 - #text, y)
       mon.write("[")
       if monColor then mon.setTextColor(col) end
       mon.write(text)
@@ -754,14 +795,15 @@ local function drawMonitorRaw()
       mon.write("v")
     end
   end
-  -- basic monitors never emit monitor_touch, so show a note instead of
-  -- a button that could not work
-  local label = monColor and "[ Settings ]" or "(use computer)"
-  if monColor then mon.setTextColor(colors.yellow) end
-  mon.setCursorPos(math.max(1, math.floor((w - #label) / 2) + 1), h)
-  mon.write(truncate(label, w))
-  if monColor then mon.setTextColor(colors.white) end
-  if monColor then monSettingsY = h end
+  -- touch monitors get a master switch; settings live on the terminal
+  if monColor then
+    local label = "[ Toggle All ]"
+    mon.setTextColor(colors.yellow)
+    mon.setCursorPos(math.max(1, math.floor((w - #label) / 2) + 1), h)
+    mon.write(truncate(label, w))
+    mon.setTextColor(colors.white)
+    monToggleAllY = h
+  end
 end
 
 local function drawMonitor()
@@ -994,6 +1036,28 @@ local function toggleSpawner(i)
   elseif spawnerOffline(sp) then
     ui.status = sp.name .. ": output offline!"
   end
+  redraw()
+end
+
+-- master switch: if anything is on, turn everything off; otherwise turn
+-- everything on. running countdowns are cancelled either way
+local function toggleAll()
+  if #config.spawners == 0 then return end
+  local anyOn = false
+  for _, sp in ipairs(config.spawners) do
+    if sp.state then
+      anyOn = true
+      break
+    end
+  end
+  local newState = not anyOn
+  for _, sp in ipairs(config.spawners) do
+    cancelSpawnerTimer(sp)
+    sp.state = newState
+    applyOutput(sp)
+  end
+  saveConfig()
+  ui.status = newState and "all spawners ON" or "all spawners OFF"
   redraw()
 end
 
@@ -1233,6 +1297,8 @@ local function handleMainKey(code)
     end
   elseif code == keys.space then
     if n > 0 then toggleSpawner(ui.mainSel) end
+  elseif code == keys.tab then
+    toggleAll()
   end
 end
 
@@ -1316,8 +1382,8 @@ local function handleTouch(name, x, y)
     toggleSpawner(i)
     return
   end
-  if monSettingsY and y == monSettingsY then
-    openScreen("settings")
+  if monToggleAllY and y == monToggleAllY then
+    toggleAll()
   end
 end
 

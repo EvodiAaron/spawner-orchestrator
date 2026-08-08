@@ -61,6 +61,7 @@ integrators attached.
 | --- | --- |
 | Up / Down | move selection |
 | Space | toggle the selected spawner |
+| Tab | toggle all at once — master switch: anything on → all off, else all on |
 | T | turn the selected spawner on for a preset duration (live countdown) |
 | A (or S) | open settings |
 | Enter / Backspace | select / go back, in menus |
@@ -70,9 +71,11 @@ Text entry: Enter accepts, Backspace on an empty field cancels.
 
 **Advanced Monitor**
 
-Tap a spawner row to toggle it; tap `[ Settings ]` to configure on the
-terminal. While settings are open the monitor shows a notice instead of a
-stale list.
+Tap a spawner row to toggle it; tap `[ Toggle All ]` for the master switch.
+Settings are configured on the terminal only. The monitor automatically
+uses the largest text scale that still fits the spawner list, so a wall
+display stays readable from a distance. While settings are open the
+monitor shows a notice instead of a stale list.
 
 ## Timers
 
