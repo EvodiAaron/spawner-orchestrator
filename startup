@@ -37,8 +37,8 @@
 -- controls (terminal): up/down select, space toggle, tab toggles all
 --   at once (master switch: anything on -> all off, else all on),
 --   T turns the selected spawner on for a preset duration (with a live
---   countdown), M cycles the persistent default timer (indefinite, 1m,
---   5m, ... 2h) that every toggle-on uses, A (or S) opens settings,
+--   countdown), M cycles the persistent default timer (Off, 1m, 5m,
+--   ... 2h) that every toggle-on uses, A (or S) opens settings,
 --   ctrl+t quits. in menus: enter selects, backspace goes back. text
 --   entry: enter accepts, backspace on an empty field cancels.
 -- controls (advanced monitor): tap a row to toggle it, tap
@@ -72,9 +72,10 @@ local TIMER_PRESETS = {
 }
 
 -- default-timer modes cycled by the monitor's bottom control (and the M
--- key): every toggle-on runs for this long; 0 means on indefinitely
+-- key): every toggle-on runs for this long; 0 ("off") means no timer,
+-- the spawner stays on until switched off
 local TIMER_MODES = {
-  { secs = 0, label = "Indefinite" },
+  { secs = 0, label = "Off" },
   { secs = 60, label = "1m" },
   { secs = 300, label = "5m" },
   { secs = 600, label = "10m" },

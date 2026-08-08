@@ -77,7 +77,7 @@ integrators attached.
 | Space | toggle the selected spawner |
 | Tab | toggle all at once — master switch: anything on → all off, else all on |
 | T | turn the selected spawner on for a one-off duration (live countdown) |
-| M | cycle the default timer: Indefinite → 1m → 5m → 10m → 15m → 30m → 1h → 2h |
+| M | cycle the default timer: Off → 1m → 5m → 10m → 15m → 30m → 1h → 2h |
 | A (or S) | open settings |
 | Enter / Backspace | select / go back, in menus |
 | Ctrl+T | quit (outputs keep their last state) |
@@ -96,9 +96,9 @@ monitor shows a notice instead of a stale list.
 ## Timers
 
 **Default timer** — the `[ Timer: … ]` control at the bottom of the monitor
-(or **M** on the terminal) cycles a persistent default: **Indefinite**, 1m,
-5m, 10m, 15m, 30m, 1h, or 2h. Every toggle-on (row tap, Space, or Toggle
-All) runs for that duration; Indefinite means stay on until switched off.
+(or **M** on the terminal) cycles a persistent default: **Off**, 1m, 5m,
+10m, 15m, 30m, 1h, or 2h. Every toggle-on (row tap, Space, or Toggle All)
+runs for that duration; Off means no timer — stay on until switched off.
 The choice is saved in the config and survives reboots.
 
 **One-off timer** — press **T** on a spawner to run it for a picked
