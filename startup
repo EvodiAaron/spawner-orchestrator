@@ -37,12 +37,14 @@
 -- controls (terminal): up/down select, space toggle, tab toggles all
 --   at once (master switch: anything on -> all off, else all on),
 --   T turns the selected spawner on for a preset duration (with a live
---   countdown), A (or S) opens settings, ctrl+t quits. in menus: enter
---   selects, backspace goes back. text entry: enter accepts, backspace
---   on an empty field cancels.
+--   countdown), M cycles the persistent default timer (indefinite, 1m,
+--   5m, ... 2h) that every toggle-on uses, A (or S) opens settings,
+--   ctrl+t quits. in menus: enter selects, backspace goes back. text
+--   entry: enter accepts, backspace on an empty field cancels.
 -- controls (advanced monitor): tap a row to toggle it, tap
---   [ Toggle All ] for the master switch. settings are terminal-only.
---   the monitor picks the largest text scale that still fits the list.
+--   [ Toggle All ] for the master switch, tap [ Timer: ... ] to cycle
+--   the default timer. settings are terminal-only. the monitor picks
+--   the largest text scale that still fits the list.
 --
 -- config lives in "config" next to this program; a corrupt file is
 -- moved to "config.bak" and the panel starts fresh.
@@ -67,6 +69,19 @@ local TIMER_PRESETS = {
   { secs = 1800, label = "30 minutes" },
   { secs = 3600, label = "1 hour" },
   { secs = 7200, label = "2 hours" },
+}
+
+-- default-timer modes cycled by the monitor's bottom control (and the M
+-- key): every toggle-on runs for this long; 0 means on indefinitely
+local TIMER_MODES = {
+  { secs = 0, label = "Indefinite" },
+  { secs = 60, label = "1m" },
+  { secs = 300, label = "5m" },
+  { secs = 600, label = "10m" },
+  { secs = 900, label = "15m" },
+  { secs = 1800, label = "30m" },
+  { secs = 3600, label = "1h" },
+  { secs = 7200, label = "2h" },
 }
 
 -- sides on the computer itself are relative to the block
@@ -115,6 +130,7 @@ local monColor = false
 local monScale = 1
 local monRowMap = {} -- monitor y -> spawner index, rebuilt on every draw
 local monToggleAllY = nil
+local monTimerY = nil
 
 local ui = {
   screen = "main", -- main|settings|edit|pick_target|pick_side|integrators|scan|confirm|input
@@ -163,6 +179,14 @@ local function cancelSpawnerTimer(sp)
   sp.timerLeft = nil
 end
 
+local function timerModeLabel()
+  local mode = config.timerMode or 0
+  for _, m in ipairs(TIMER_MODES) do
+    if m.secs == mode then return m.label end
+  end
+  return formatCountdown(mode)
+end
+
 -- only touch colours on colour-capable displays; basic displays keep
 -- their white-on-black defaults and rely on text markers instead
 local function setColors(t, fg, bg)
@@ -177,7 +201,7 @@ end
 -- ---------------------------------------------------------------------
 
 local function defaultConfig()
-  return { version = 1, spawners = {}, integrators = {} }
+  return { version = 1, spawners = {}, integrators = {}, timerMode = 0 }
 end
 
 local function validSpawner(sp)
@@ -199,6 +223,8 @@ local function validConfig(c)
   if c.version ~= 1 then return false end
   if type(c.spawners) ~= "table" then return false end
   if type(c.integrators) ~= "table" then return false end
+  -- optional field: default timer in seconds, 0 = indefinite
+  if c.timerMode ~= nil and type(c.timerMode) ~= "number" then return false end
   for _, sp in ipairs(c.spawners) do
     if not validSpawner(sp) then return false end
   end
@@ -250,6 +276,8 @@ local function loadConfig()
   if text then data = textutils.unserialize(text) end
   if validConfig(data) then
     config = data
+    -- older configs predate the default-timer field
+    if type(config.timerMode) ~= "number" then config.timerMode = 0 end
   else
     -- unreadable or wrong shape: keep it for inspection, start fresh
     if fs.exists(CONFIG_BAK) then fs.delete(CONFIG_BAK) end
@@ -344,7 +372,8 @@ local function updateMonitorScale()
   local w1 = w * monScale -- character grid the monitor would have at scale 1
   local h1 = h * monScale
   local n = config and #config.spawners or 0
-  local rowsNeeded = math.max(5, n + 3)
+  -- touch monitors carry two control rows at the bottom, basic ones none
+  local rowsNeeded = math.max(5, n + (monColor and 4 or 2))
   local s = 5
   while s > 0.5 do
     if math.floor(w1 / s) >= 15 and math.floor(h1 / s) >= rowsNeeded then
@@ -534,12 +563,15 @@ local function drawTermMain()
       t.write("v")
     end
   end
-  -- settings entry point
+  -- settings entry point and the persistent default-timer mode
   t.setCursorPos(2, h - 1)
   if t.isColor() then t.setTextColor(colors.yellow) end
   t.write("[A]")
   if t.isColor() then t.setTextColor(colors.white) end
-  t.write(" Settings")
+  t.write(" Settings  ")
+  if t.isColor() then t.setTextColor(colors.cyan) end
+  t.write(truncate("Timer: " .. timerModeLabel() .. " (M)", w - 15))
+  if t.isColor() then t.setTextColor(colors.white) end
   -- status / key hint line
   t.setCursorPos(2, h)
   if ui.status then
@@ -710,6 +742,7 @@ local function drawMonitorRaw()
   local w, h = mon.getSize()
   monRowMap = {}
   monToggleAllY = nil
+  monTimerY = nil
   if monColor then
     mon.setTextColor(colors.white)
     mon.setBackgroundColor(colors.black)
@@ -747,7 +780,7 @@ local function drawMonitorRaw()
     mon.setBackgroundColor(colors.black)
     mon.setTextColor(colors.white)
   end
-  -- basic monitors have no touch, so no button row: the list gets the space
+  -- basic monitors have no touch, so no control rows: the list gets the space
   local listH = monColor and math.max(1, h - 3) or math.max(1, h - 1)
   local n = #config.spawners
   if n == 0 then
@@ -795,14 +828,20 @@ local function drawMonitorRaw()
       mon.write("v")
     end
   end
-  -- touch monitors get a master switch; settings live on the terminal
+  -- touch monitors get a master switch and the default-timer selector;
+  -- settings live on the terminal
   if monColor then
     local label = "[ Toggle All ]"
     mon.setTextColor(colors.yellow)
+    mon.setCursorPos(math.max(1, math.floor((w - #label) / 2) + 1), h - 1)
+    mon.write(truncate(label, w))
+    monToggleAllY = h - 1
+    label = "[ Timer: " .. timerModeLabel() .. " ]"
+    mon.setTextColor(colors.cyan)
     mon.setCursorPos(math.max(1, math.floor((w - #label) / 2) + 1), h)
     mon.write(truncate(label, w))
     mon.setTextColor(colors.white)
-    monToggleAllY = h
+    monTimerY = h
   end
 end
 
@@ -1025,10 +1064,14 @@ end
 local function toggleSpawner(i)
   local sp = config.spawners[i]
   if not sp then return end
-  -- a manual toggle always cancels a running countdown; toggling on this
-  -- way means "on indefinitely"
+  -- a manual toggle always cancels a running countdown; toggling on
+  -- runs for the default timer mode (0 = on indefinitely)
   cancelSpawnerTimer(sp)
   sp.state = not sp.state
+  if sp.state and (config.timerMode or 0) > 0 then
+    timerEnds[sp] = os.clock() + config.timerMode
+    ensureTick()
+  end
   applyOutput(sp)
   saveConfig()
   if sp.target == "none" then
@@ -1054,10 +1097,32 @@ local function toggleAll()
   for _, sp in ipairs(config.spawners) do
     cancelSpawnerTimer(sp)
     sp.state = newState
+    if newState and (config.timerMode or 0) > 0 then
+      timerEnds[sp] = os.clock() + config.timerMode
+    end
     applyOutput(sp)
   end
+  ensureTick()
   saveConfig()
   ui.status = newState and "all spawners ON" or "all spawners OFF"
+  redraw()
+end
+
+-- step the persistent default timer to the next preset (wraps around)
+local function cycleTimerMode()
+  local mode = config.timerMode or 0
+  local idx = 1
+  for i, m in ipairs(TIMER_MODES) do
+    if m.secs == mode then
+      idx = i
+      break
+    end
+  end
+  idx = idx + 1
+  if idx > #TIMER_MODES then idx = 1 end
+  config.timerMode = TIMER_MODES[idx].secs
+  saveConfig()
+  ui.status = "default timer: " .. TIMER_MODES[idx].label
   redraw()
 end
 
@@ -1364,6 +1429,8 @@ local function handleChar(ch)
         ui.timerIndex = ui.mainSel
         openScreen("pick_timer")
       end
+    elseif ch == "m" or ch == "M" then
+      cycleTimerMode()
     end
   end
 end
@@ -1384,6 +1451,10 @@ local function handleTouch(name, x, y)
   end
   if monToggleAllY and y == monToggleAllY then
     toggleAll()
+    return
+  end
+  if monTimerY and y == monTimerY then
+    cycleTimerMode()
   end
 end
 
