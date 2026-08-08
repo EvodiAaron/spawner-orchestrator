@@ -15,14 +15,14 @@ On the Advanced Computer, run:
 ```
 wget https://raw.githubusercontent.com/EvodiAaron/spawner-orchestrator/main/install install
 install
-reboot
 ```
 
-The `install` script deletes any existing `startup` and downloads the
-latest one. It fetches before it deletes, so a failed download never
-leaves the computer without a program.
+The `install` script deletes any existing `startup`, downloads the latest
+one, and reboots the computer to start the panel. It fetches before it
+deletes, so a failed download never leaves the computer without a program
+(and it only reboots on success).
 
-**Updating later:** just run `install` again, then `reboot`.
+**Updating later:** just run `install` again.
 
 If you'd rather skip the installer, a one-off manual fetch works too:
 

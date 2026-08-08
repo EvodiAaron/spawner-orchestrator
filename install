@@ -9,7 +9,8 @@
 -- usage (first time, on the computer):
 --   wget https://raw.githubusercontent.com/EvodiAaron/spawner-orchestrator/main/install install
 --   install
--- afterwards just run "install" again to update, then "reboot".
+-- afterwards just run "install" again to update. on success the
+-- computer reboots itself to start the panel.
 --
 -- requires http to be enabled in the server's computercraft config
 -- (http_enable = true, the default on most packs).
@@ -59,4 +60,6 @@ if fs.exists(TARGET) then fs.delete(TARGET) end
 fs.move(TMP, TARGET)
 
 print("installed " .. TARGET .. " (" .. #body .. " bytes).")
-print("run \"reboot\" to start the panel.")
+print("rebooting in 3 seconds to start the panel...")
+sleep(3)
+os.reboot()
