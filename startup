@@ -1,0 +1,1422 @@
+-- =====================================================================
+-- spawner control panel
+-- ender io powered spawner switchboard for cc: tweaked (mc 1.12.2)
+--
+-- installation:
+--   * place an advanced computer near your spawners
+--   * copy this file onto it as "startup" (drop it into
+--     saves/<world>/computercraft/computer/<id>/startup, or run
+--     "edit startup" in-game and paste it)
+--   * reboot the computer; the panel starts automatically and
+--     re-applies every saved spawner state to its redstone output
+--     (a reboot resets all outputs to off, which is why this file
+--     must be named "startup")
+--
+-- hardware:
+--   * required: one advanced computer (colour + arrow keys)
+--   * optional: an advanced monitor for a touch panel. place it
+--     touching the computer or connect it over wired modems. a basic
+--     monitor also works but is display-only (no touch). only the
+--     first attached monitor is used.
+--   * optional: plethora redstone integrators for spawners that are
+--     not adjacent to the computer itself
+--
+-- adding your first integrator:
+--   1. place a redstone integrator against the ender io powered
+--      spawner. integrators emit on absolute sides:
+--      up/down/north/south/east/west
+--   2. connect the integrator and the computer with wired modems and
+--      networking cable, then right-click each modem so it lights red
+--   3. on the panel press A (settings) -> manage integrators ->
+--      scan for integrators, and add the one that appears
+--      (e.g. "redstone_integrator_0")
+--   4. back in settings, add a spawner, set its target to that
+--      integrator, pick the side that faces the spawner, and set
+--      "inverted" to match the spawner's own redstone mode
+--
+-- controls (terminal): up/down select, space toggle, T turns the
+--   selected spawner on for a preset duration (with a live countdown),
+--   A (or S) opens settings, ctrl+t quits. in menus: enter selects,
+--   backspace goes back. text entry: enter accepts, backspace on an
+--   empty field cancels.
+-- controls (advanced monitor): tap a row to toggle it, tap
+--   [ Settings ] to configure on the terminal.
+--
+-- config lives in "config" next to this program; a corrupt file is
+-- moved to "config.bak" and the panel starts fresh.
+-- =====================================================================
+
+-- ---------------------------------------------------------------------
+-- constants
+-- ---------------------------------------------------------------------
+
+local CONFIG_FILE = "config"
+local CONFIG_TMP = "config.tmp"
+local CONFIG_BAK = "config.bak"
+local MAX_NAME_LEN = 24
+local MAX_INPUT_LEN = 32
+
+-- timer presets offered when turning a spawner on for a set duration
+local TIMER_PRESETS = {
+  { secs = 60, label = "1 minute" },
+  { secs = 300, label = "5 minutes" },
+  { secs = 600, label = "10 minutes" },
+  { secs = 900, label = "15 minutes" },
+  { secs = 1800, label = "30 minutes" },
+  { secs = 3600, label = "1 hour" },
+  { secs = 7200, label = "2 hours" },
+}
+
+-- sides on the computer itself are relative to the block
+local SELF_SIDES = { "top", "bottom", "left", "right", "front", "back" }
+-- sides on a redstone integrator are absolute world directions
+local INTEG_SIDES = { "up", "down", "north", "south", "east", "west" }
+
+local function makeSet(list)
+  local set = {}
+  for _, v in ipairs(list) do set[v] = true end
+  return set
+end
+
+local SELF_SIDE_SET = makeSet(SELF_SIDES)
+local INTEG_SIDE_SET = makeSet(INTEG_SIDES)
+
+local function sidesFor(target)
+  if target == "self" then return SELF_SIDES end
+  return INTEG_SIDES
+end
+
+local function isValidSide(target, side)
+  if target == "self" then return SELF_SIDE_SET[side] == true end
+  return INTEG_SIDE_SET[side] == true
+end
+
+-- ---------------------------------------------------------------------
+-- state
+-- ---------------------------------------------------------------------
+
+local config
+
+-- runtime-only: [spawner table] = true when the last output write failed;
+-- kept out of the config table so it is never serialised
+local applyFailed = {}
+
+-- runtime-only countdown timers: [spawner table] = os.clock() deadline.
+-- the remaining seconds are mirrored into sp.timerLeft on every save so
+-- a countdown survives a reboot (it resumes from the last saved value)
+local timerEnds = {}
+local tickTimerId = nil
+
+-- monitor state
+local mon, monName
+local monColor = false
+local monRowMap = {} -- monitor y -> spawner index, rebuilt on every draw
+local monSettingsY = nil
+
+local ui = {
+  screen = "main", -- main|settings|edit|pick_target|pick_side|integrators|scan|confirm|input
+  mainSel = 1,
+  mainScroll = 0,
+  sel = 1,      -- selection for menu screens
+  scroll = 0,
+  items = {},   -- menu items for the current screen
+  editIndex = nil,
+  timerIndex = nil, -- spawner the timer picker was opened for
+  confirm = nil,
+  input = nil,
+  status = nil, -- transient one-line message
+}
+
+-- ---------------------------------------------------------------------
+-- small utilities
+-- ---------------------------------------------------------------------
+
+local function truncate(s, maxLen)
+  if maxLen < 1 then return "" end
+  if #s <= maxLen then return s end
+  if maxLen == 1 then return string.sub(s, 1, 1) end
+  return string.sub(s, 1, maxLen - 1) .. "~"
+end
+
+local function formatCountdown(secs)
+  secs = math.floor(secs)
+  if secs < 0 then secs = 0 end
+  local h = math.floor(secs / 3600)
+  local m = math.floor((secs % 3600) / 60)
+  local s = secs % 60
+  if h > 0 then return string.format("%d:%02d:%02d", h, m, s) end
+  return string.format("%d:%02d", m, s)
+end
+
+-- keep exactly one 1-second os.startTimer alive while any countdown runs
+local function ensureTick()
+  if next(timerEnds) ~= nil and tickTimerId == nil then
+    tickTimerId = os.startTimer(1)
+  end
+end
+
+local function cancelSpawnerTimer(sp)
+  timerEnds[sp] = nil
+  sp.timerLeft = nil
+end
+
+-- only touch colours on colour-capable displays; basic displays keep
+-- their white-on-black defaults and rely on text markers instead
+local function setColors(t, fg, bg)
+  if t.isColor() then
+    t.setTextColor(fg)
+    t.setBackgroundColor(bg)
+  end
+end
+
+-- ---------------------------------------------------------------------
+-- config load / save
+-- ---------------------------------------------------------------------
+
+local function defaultConfig()
+  return { version = 1, spawners = {}, integrators = {} }
+end
+
+local function validSpawner(sp)
+  if type(sp) ~= "table" then return false end
+  if type(sp.name) ~= "string" then return false end
+  if type(sp.target) ~= "string" then return false end
+  if type(sp.side) ~= "string" then return false end
+  if type(sp.inverted) ~= "boolean" then return false end
+  if type(sp.state) ~= "boolean" then return false end
+  -- optional field: seconds left on a running countdown at save time
+  if sp.timerLeft ~= nil and type(sp.timerLeft) ~= "number" then return false end
+  if sp.target == "none" then return sp.side == "none" end
+  return isValidSide(sp.target, sp.side)
+end
+
+local function validConfig(c)
+  if type(c) ~= "table" then return false end
+  -- bump this check and add migration code here when the schema changes
+  if c.version ~= 1 then return false end
+  if type(c.spawners) ~= "table" then return false end
+  if type(c.integrators) ~= "table" then return false end
+  for _, sp in ipairs(c.spawners) do
+    if not validSpawner(sp) then return false end
+  end
+  for _, name in ipairs(c.integrators) do
+    if type(name) ~= "string" or name == "" then return false end
+  end
+  return true
+end
+
+local function saveConfig()
+  -- mirror running countdowns into the persisted table so a reboot can
+  -- resume them from the last saved remaining time
+  local now = os.clock()
+  for _, sp in ipairs(config.spawners) do
+    local endT = timerEnds[sp]
+    if endT then
+      sp.timerLeft = math.max(1, math.floor(endT - now))
+    else
+      sp.timerLeft = nil
+    end
+  end
+  -- serialise to a temp file first so a crash mid-write never leaves a
+  -- half-written config behind
+  local h = fs.open(CONFIG_TMP, "w")
+  if not h then
+    ui.status = "could not write config!"
+    return
+  end
+  h.write(textutils.serialize(config))
+  h.close()
+  -- fs.move refuses to overwrite, so drop the old file just before the
+  -- move; the finished temp file survives even if we die between these
+  if fs.exists(CONFIG_FILE) then fs.delete(CONFIG_FILE) end
+  fs.move(CONFIG_TMP, CONFIG_FILE)
+end
+
+local function loadConfig()
+  if not fs.exists(CONFIG_FILE) then
+    config = defaultConfig()
+    return
+  end
+  local h = fs.open(CONFIG_FILE, "r")
+  local text
+  if h then
+    text = h.readAll()
+    h.close()
+  end
+  local data
+  if text then data = textutils.unserialize(text) end
+  if validConfig(data) then
+    config = data
+  else
+    -- unreadable or wrong shape: keep it for inspection, start fresh
+    if fs.exists(CONFIG_BAK) then fs.delete(CONFIG_BAK) end
+    fs.move(CONFIG_FILE, CONFIG_BAK)
+    config = defaultConfig()
+    saveConfig()
+  end
+end
+
+-- ---------------------------------------------------------------------
+-- redstone output
+-- ---------------------------------------------------------------------
+
+-- write the spawner's logical state to its output, honouring polarity
+local function applyOutput(sp)
+  if sp.target == "none" then return end
+  local physical = sp.state
+  if sp.inverted then physical = not physical end
+  local ok
+  if sp.target == "self" then
+    ok = pcall(redstone.setOutput, sp.side, physical)
+  else
+    ok = pcall(peripheral.call, sp.target, "setOutput", sp.side, physical)
+  end
+  if ok then
+    applyFailed[sp] = nil
+  else
+    applyFailed[sp] = true
+  end
+end
+
+-- drive the output to the level that means "machine off"; used before a
+-- spawner is removed or its target/side is reassigned, so the abandoned
+-- face is never left holding the machine on
+local function forceLogicalOff(sp)
+  if sp.target == "none" then return end
+  local physical = sp.inverted -- logical off is electrical high when inverted
+  if sp.target == "self" then
+    pcall(redstone.setOutput, sp.side, physical)
+  else
+    pcall(peripheral.call, sp.target, "setOutput", sp.side, physical)
+  end
+  applyFailed[sp] = nil
+end
+
+local function applyAll()
+  for _, sp in ipairs(config.spawners) do
+    applyOutput(sp)
+  end
+end
+
+-- ---------------------------------------------------------------------
+-- peripherals
+-- ---------------------------------------------------------------------
+
+local function integratorPresent(name)
+  return peripheral.isPresent(name)
+    and peripheral.getType(name) == "redstone_integrator"
+end
+
+local function knownIntegrator(name)
+  for _, n in ipairs(config.integrators) do
+    if n == name then return true end
+  end
+  return false
+end
+
+local function spawnerOffline(sp)
+  if sp.target == "self" or sp.target == "none" then return false end
+  return (not integratorPresent(sp.target)) or applyFailed[sp] == true
+end
+
+local function scanForIntegrators()
+  local found = {}
+  for _, name in ipairs(peripheral.getNames()) do
+    local ok, ptype = pcall(peripheral.getType, name)
+    if ok and ptype == "redstone_integrator" and not knownIntegrator(name) then
+      found[#found + 1] = name
+    end
+  end
+  return found
+end
+
+local function findMonitor()
+  local newMon, newName
+  -- the filter callback only captures the peripheral's name, which is
+  -- what monitor_touch events report; returning false keeps find cheap
+  peripheral.find("monitor", function(name, m)
+    if not newMon then
+      newMon = m
+      newName = name
+    end
+    return false
+  end)
+  if newName == monName then
+    mon = newMon -- refresh the handle, keep the scale we already set
+    return
+  end
+  mon, monName = newMon, newName
+  monColor = false
+  if mon then
+    local ok, c = pcall(mon.isColor)
+    monColor = (ok and c) or false -- advanced monitors are the colour ones
+    pcall(function()
+      mon.setTextScale(1)
+      local mw = mon.getSize()
+      -- small monitors get a smaller text scale so rows still fit
+      if mw < 18 then mon.setTextScale(0.5) end
+    end)
+  end
+end
+
+local function removeIntegratorByName(name)
+  for i, n in ipairs(config.integrators) do
+    if n == name then
+      table.remove(config.integrators, i)
+      return
+    end
+  end
+end
+
+-- ---------------------------------------------------------------------
+-- layout helpers
+-- ---------------------------------------------------------------------
+
+local function termMainListH()
+  local _, h = term.getSize()
+  return math.max(1, h - 5)
+end
+
+local function termMenuListH()
+  local _, h = term.getSize()
+  return math.max(1, h - 4)
+end
+
+local function clampMainScroll()
+  local listH = termMainListH()
+  local n = #config.spawners
+  if ui.mainSel < 1 then ui.mainSel = 1 end
+  if ui.mainSel > n then ui.mainSel = math.max(1, n) end
+  if ui.mainScroll > ui.mainSel - 1 then ui.mainScroll = ui.mainSel - 1 end
+  if ui.mainSel > ui.mainScroll + listH then ui.mainScroll = ui.mainSel - listH end
+  local maxScroll = math.max(0, n - listH)
+  if ui.mainScroll > maxScroll then ui.mainScroll = maxScroll end
+  if ui.mainScroll < 0 then ui.mainScroll = 0 end
+end
+
+local function clampMenuScroll()
+  local listH = termMenuListH()
+  local n = #ui.items
+  if ui.sel < 1 then ui.sel = 1 end
+  if ui.sel > n then ui.sel = math.max(1, n) end
+  if ui.scroll > ui.sel - 1 then ui.scroll = ui.sel - 1 end
+  if ui.sel > ui.scroll + listH then ui.scroll = ui.sel - listH end
+  local maxScroll = math.max(0, n - listH)
+  if ui.scroll > maxScroll then ui.scroll = maxScroll end
+  if ui.scroll < 0 then ui.scroll = 0 end
+end
+
+-- ---------------------------------------------------------------------
+-- rendering
+-- ---------------------------------------------------------------------
+
+local function spawnerStatusText(sp)
+  if sp.target == "none" then return "---", colors.lightGray end
+  if sp.state then return " ON", colors.lime end
+  return "OFF", colors.red
+end
+
+local function drawTooSmall(t, w, h)
+  t.setCursorPos(1, 1)
+  t.write(truncate("terminal too small", w))
+  if h >= 2 then
+    t.setCursorPos(1, 2)
+    t.write(truncate("need at least 26x8", w))
+  end
+end
+
+local function drawTitleBar(t, w, title)
+  setColors(t, colors.white, colors.blue)
+  t.setCursorPos(1, 1)
+  t.clearLine()
+  t.setCursorPos(2, 1)
+  t.write(truncate(title, w - 2))
+  setColors(t, colors.white, colors.black)
+end
+
+local function drawTermMain()
+  local t = term
+  local w, h = t.getSize()
+  setColors(t, colors.white, colors.black)
+  t.clear()
+  if w < 26 or h < 8 then
+    drawTooSmall(t, w, h)
+    return
+  end
+  clampMainScroll()
+  drawTitleBar(t, w, "Spawner Control Panel")
+  local listH = termMainListH()
+  local n = #config.spawners
+  local anyOffline = false
+  for _, sp in ipairs(config.spawners) do
+    if spawnerOffline(sp) then
+      anyOffline = true
+      break
+    end
+  end
+  if n == 0 then
+    t.setCursorPos(2, 3)
+    t.write("(no spawners configured)")
+    t.setCursorPos(2, 4)
+    t.write("press A to open settings")
+  else
+    for row = 1, listH do
+      local i = ui.mainScroll + row
+      if i > n then break end
+      local sp = config.spawners[i]
+      local y = 2 + row
+      local selected = (i == ui.mainSel)
+      if selected then
+        setColors(t, colors.white, colors.gray)
+        t.setCursorPos(1, y)
+        t.clearLine()
+      end
+      t.setCursorPos(1, y)
+      t.write(selected and ">" or " ")
+      local endT = timerEnds[sp]
+      t.setCursorPos(3, y)
+      t.write(truncate(sp.name, endT and (w - 21) or (w - 13)))
+      if endT then
+        local cd = formatCountdown(endT - os.clock())
+        if t.isColor() then t.setTextColor(colors.cyan) end
+        t.setCursorPos(w - 9 - #cd, y)
+        t.write(cd)
+        if t.isColor() then t.setTextColor(colors.white) end
+      end
+      local offline = spawnerOffline(sp)
+      if offline then
+        if t.isColor() then t.setTextColor(colors.yellow) end
+        t.setCursorPos(w - 8, y)
+        t.write("!")
+        if t.isColor() then t.setTextColor(colors.white) end
+      end
+      local text, col = spawnerStatusText(sp)
+      t.setCursorPos(w - 6, y)
+      t.write("[")
+      if t.isColor() then t.setTextColor(col) end
+      t.write(text)
+      if t.isColor() then t.setTextColor(colors.white) end
+      t.write("]")
+      if selected then setColors(t, colors.white, colors.black) end
+    end
+    if ui.mainScroll > 0 then
+      t.setCursorPos(w, 3)
+      t.write("^")
+    end
+    if ui.mainScroll + listH < n then
+      t.setCursorPos(w, 2 + listH)
+      t.write("v")
+    end
+  end
+  -- settings entry point
+  t.setCursorPos(2, h - 1)
+  if t.isColor() then t.setTextColor(colors.yellow) end
+  t.write("[A]")
+  if t.isColor() then t.setTextColor(colors.white) end
+  t.write(" Settings")
+  -- status / key hint line
+  t.setCursorPos(2, h)
+  if ui.status then
+    if t.isColor() then t.setTextColor(colors.yellow) end
+    t.write(truncate(ui.status, w - 2))
+  else
+    if t.isColor() then t.setTextColor(colors.lightGray) end
+    local hint = "Up/Dn move  Space toggle  T timer  A settings"
+    if anyOffline then hint = "Space toggle  T timer  A settings  !=offline" end
+    t.write(truncate(hint, w - 2))
+  end
+  if t.isColor() then t.setTextColor(colors.white) end
+end
+
+local function drawTermMenu(title)
+  local t = term
+  local w, h = t.getSize()
+  setColors(t, colors.white, colors.black)
+  t.clear()
+  if w < 26 or h < 8 then
+    drawTooSmall(t, w, h)
+    return
+  end
+  clampMenuScroll()
+  drawTitleBar(t, w, title)
+  local listH = termMenuListH()
+  for row = 1, listH do
+    local i = ui.scroll + row
+    if i > #ui.items then break end
+    local it = ui.items[i]
+    local y = 2 + row
+    local selected = (i == ui.sel)
+    if selected then
+      setColors(t, colors.white, colors.gray)
+      t.setCursorPos(1, y)
+      t.clearLine()
+    end
+    t.setCursorPos(1, y)
+    t.write(selected and ">" or " ")
+    if it.dim and not selected and t.isColor() then
+      t.setTextColor(colors.lightGray)
+    end
+    t.setCursorPos(3, y)
+    t.write(truncate(it.label, w - 4))
+    setColors(t, colors.white, colors.black)
+  end
+  if ui.scroll > 0 then
+    t.setCursorPos(w, 3)
+    t.write("^")
+  end
+  if ui.scroll + listH < #ui.items then
+    t.setCursorPos(w, 2 + listH)
+    t.write("v")
+  end
+  if ui.status then
+    t.setCursorPos(2, h - 1)
+    if t.isColor() then t.setTextColor(colors.yellow) end
+    t.write(truncate(ui.status, w - 2))
+  end
+  t.setCursorPos(2, h)
+  if t.isColor() then t.setTextColor(colors.lightGray) end
+  t.write(truncate("Up/Dn move  Enter select  Backspace back", w - 2))
+  if t.isColor() then t.setTextColor(colors.white) end
+end
+
+local function drawTermConfirm()
+  local t = term
+  local w, h = t.getSize()
+  setColors(t, colors.white, colors.black)
+  t.clear()
+  if w < 26 or h < 8 then
+    drawTooSmall(t, w, h)
+    return
+  end
+  drawTitleBar(t, w, ui.confirm.title)
+  local y = 3
+  for _, line in ipairs(ui.confirm.lines) do
+    t.setCursorPos(2, y)
+    t.write(truncate(line, w - 2))
+    y = y + 1
+  end
+  y = y + 1
+  for i, it in ipairs(ui.items) do
+    if y > h - 1 then break end
+    local selected = (i == ui.sel)
+    if selected then
+      setColors(t, colors.white, colors.gray)
+      t.setCursorPos(1, y)
+      t.clearLine()
+    end
+    t.setCursorPos(1, y)
+    t.write(selected and ">" or " ")
+    t.setCursorPos(3, y)
+    t.write(truncate(it.label, w - 4))
+    if selected then setColors(t, colors.white, colors.black) end
+    y = y + 1
+  end
+  t.setCursorPos(2, h)
+  if t.isColor() then t.setTextColor(colors.lightGray) end
+  t.write(truncate("Up/Dn move  Enter select  Backspace cancel", w - 2))
+  if t.isColor() then t.setTextColor(colors.white) end
+end
+
+local function drawTermInput()
+  local t = term
+  local w, h = t.getSize()
+  setColors(t, colors.white, colors.black)
+  t.clear()
+  if w < 26 or h < 8 then
+    drawTooSmall(t, w, h)
+    return
+  end
+  drawTitleBar(t, w, ui.input.title)
+  t.setCursorPos(2, 3)
+  t.write(truncate(ui.input.prompt, w - 2))
+  -- text box with a manually drawn cursor; read() is deliberately not
+  -- used because it would block the event loop and queue up touches
+  local maxVisible = w - 6
+  local visible = ui.input.buffer
+  if #visible > maxVisible then
+    visible = string.sub(visible, #visible - maxVisible + 1)
+  end
+  t.setCursorPos(2, 5)
+  t.write("> " .. visible)
+  if t.isColor() then t.setTextColor(colors.yellow) end
+  t.write("_")
+  t.setCursorPos(2, h)
+  if t.isColor() then t.setTextColor(colors.lightGray) end
+  t.write(truncate("Enter accepts  Backspace on empty cancels", w - 2))
+  if t.isColor() then t.setTextColor(colors.white) end
+end
+
+local function drawTerm()
+  local s = ui.screen
+  if s == "main" then
+    drawTermMain()
+  elseif s == "input" then
+    drawTermInput()
+  elseif s == "confirm" then
+    drawTermConfirm()
+  else
+    local title
+    if s == "settings" then
+      title = "Settings"
+    elseif s == "edit" then
+      local sp = config.spawners[ui.editIndex]
+      title = "Edit: " .. (sp and sp.name or "?")
+    elseif s == "pick_target" then
+      title = "Choose output target"
+    elseif s == "pick_side" then
+      title = "Choose output side"
+    elseif s == "pick_timer" then
+      local sp = config.spawners[ui.timerIndex]
+      title = "Timer: " .. (sp and sp.name or "?")
+    elseif s == "integrators" then
+      title = "Redstone integrators"
+    elseif s == "scan" then
+      title = "Scan for integrators"
+    else
+      title = s
+    end
+    drawTermMenu(title)
+  end
+end
+
+local function drawMonitorRaw()
+  local w, h = mon.getSize()
+  monRowMap = {}
+  monSettingsY = nil
+  if monColor then
+    mon.setTextColor(colors.white)
+    mon.setBackgroundColor(colors.black)
+  end
+  mon.clear()
+  if w < 8 or h < 3 then
+    mon.setCursorPos(1, 1)
+    mon.write(truncate("panel", w))
+    return
+  end
+  if ui.screen ~= "main" then
+    -- never show a stale list while settings are open
+    local msg1 = "Configuration in"
+    local msg2 = "progress on terminal"
+    local midY = math.max(1, math.floor(h / 2))
+    mon.setCursorPos(math.max(1, math.floor((w - #msg1) / 2) + 1), midY)
+    mon.write(truncate(msg1, w))
+    if midY + 1 <= h then
+      mon.setCursorPos(math.max(1, math.floor((w - #msg2) / 2) + 1), midY + 1)
+      mon.write(truncate(msg2, w))
+    end
+    return
+  end
+  mon.setCursorPos(2, 1)
+  mon.write(truncate("Spawners", w - 1))
+  local listH = math.max(1, h - 3)
+  local n = #config.spawners
+  if n == 0 then
+    mon.setCursorPos(2, 2)
+    mon.write(truncate("(none configured)", w - 1))
+  else
+    for row = 1, listH do
+      local i = ui.mainScroll + row
+      if i > n then break end
+      local sp = config.spawners[i]
+      local y = 1 + row
+      monRowMap[y] = i
+      local endT = timerEnds[sp]
+      local showTimer = endT and w >= 22
+      mon.setCursorPos(2, y)
+      mon.write(truncate(sp.name, showTimer and (w - 17) or (w - 9)))
+      if showTimer then
+        local cd = formatCountdown(endT - os.clock())
+        if monColor then mon.setTextColor(colors.cyan) end
+        mon.setCursorPos(w - 8 - #cd, y)
+        mon.write(cd)
+        if monColor then mon.setTextColor(colors.white) end
+      end
+      if spawnerOffline(sp) then
+        if monColor then mon.setTextColor(colors.yellow) end
+        mon.setCursorPos(w - 7, y)
+        mon.write("!")
+        if monColor then mon.setTextColor(colors.white) end
+      end
+      local text, col = spawnerStatusText(sp)
+      mon.setCursorPos(w - 5, y)
+      mon.write("[")
+      if monColor then mon.setTextColor(col) end
+      mon.write(text)
+      if monColor then mon.setTextColor(colors.white) end
+      mon.write("]")
+    end
+    if ui.mainScroll > 0 then
+      mon.setCursorPos(w, 2)
+      mon.write("^")
+    end
+    if ui.mainScroll + listH < n then
+      mon.setCursorPos(w, 1 + listH)
+      mon.write("v")
+    end
+  end
+  -- basic monitors never emit monitor_touch, so show a note instead of
+  -- a button that could not work
+  local label = monColor and "[ Settings ]" or "(use computer)"
+  if monColor then mon.setTextColor(colors.yellow) end
+  mon.setCursorPos(math.max(1, math.floor((w - #label) / 2) + 1), h)
+  mon.write(truncate(label, w))
+  if monColor then mon.setTextColor(colors.white) end
+  if monColor then monSettingsY = h end
+end
+
+local function drawMonitor()
+  if not mon then return end
+  -- the monitor may be detached mid-draw; the detach event will clean up
+  pcall(drawMonitorRaw)
+end
+
+local function redraw()
+  drawTerm()
+  drawMonitor()
+end
+
+-- ---------------------------------------------------------------------
+-- menu item builders
+-- ---------------------------------------------------------------------
+
+local function targetLabel(target)
+  if target == "self" then return "self (this computer)" end
+  if target == "none" then return "unassigned" end
+  if integratorPresent(target) then return target end
+  return target .. " (offline)"
+end
+
+local function buildSettingsItems()
+  local items = {}
+  for i, sp in ipairs(config.spawners) do
+    items[#items + 1] = { kind = "spawner", index = i, label = sp.name }
+  end
+  items[#items + 1] = { kind = "add", label = "[ Add spawner ]" }
+  items[#items + 1] = { kind = "integrators", label = "[ Manage integrators ]" }
+  items[#items + 1] = { kind = "back", label = "[ Back ]" }
+  return items
+end
+
+local function buildEditItems()
+  local sp = config.spawners[ui.editIndex]
+  if not sp then
+    return { { kind = "back", label = "[ Back ]" } }
+  end
+  return {
+    { kind = "rename", label = "Name: " .. sp.name },
+    { kind = "target", label = "Target: " .. targetLabel(sp.target) },
+    { kind = "side", label = "Side: " .. sp.side, dim = (sp.target == "none") },
+    { kind = "inverted", label = "Inverted: " .. (sp.inverted and "yes" or "no") },
+    { kind = "remove", label = "[ Remove spawner ]" },
+    { kind = "back", label = "[ Back ]" },
+  }
+end
+
+local function buildPickTargetItems()
+  local items = {
+    { kind = "targetopt", value = "self", label = "self (this computer)" },
+  }
+  for _, name in ipairs(config.integrators) do
+    local label = name
+    if not integratorPresent(name) then label = label .. " (offline)" end
+    items[#items + 1] = { kind = "targetopt", value = name, label = label }
+  end
+  items[#items + 1] = { kind = "targetopt", value = "none", label = "unassigned (no output)" }
+  items[#items + 1] = { kind = "back", label = "[ Cancel ]" }
+  return items
+end
+
+local function buildPickSideItems()
+  local sp = config.spawners[ui.editIndex]
+  local items = {}
+  if sp and sp.target ~= "none" then
+    -- only the side names valid for this target type are offered, so an
+    -- invalid target/side combination is impossible to enter
+    for _, side in ipairs(sidesFor(sp.target)) do
+      local label = side
+      if side == sp.side then label = label .. "  (current)" end
+      items[#items + 1] = { kind = "sideopt", value = side, label = label }
+    end
+  end
+  items[#items + 1] = { kind = "back", label = "[ Cancel ]" }
+  return items
+end
+
+local function buildIntegratorItems()
+  local items = {}
+  if #config.integrators == 0 then
+    items[#items + 1] = { kind = "noop", label = "(no integrators configured)", dim = true }
+  end
+  for _, name in ipairs(config.integrators) do
+    local label = name
+    if not integratorPresent(name) then label = label .. " (offline)" end
+    items[#items + 1] = { kind = "integ", name = name, label = label }
+  end
+  items[#items + 1] = { kind = "scan", label = "[ Scan for integrators ]" }
+  items[#items + 1] = { kind = "manual", label = "[ Add by name ]" }
+  items[#items + 1] = { kind = "back", label = "[ Back ]" }
+  return items
+end
+
+local function buildScanItems()
+  local items = {}
+  local found = scanForIntegrators()
+  if #found == 0 then
+    items[#items + 1] = { kind = "noop", label = "(no new integrators found)", dim = true }
+  end
+  for _, name in ipairs(found) do
+    items[#items + 1] = { kind = "found", name = name, label = "+ " .. name }
+  end
+  items[#items + 1] = { kind = "rescan", label = "[ Rescan ]" }
+  items[#items + 1] = { kind = "back", label = "[ Back ]" }
+  return items
+end
+
+local function buildPickTimerItems()
+  local items = {}
+  for _, preset in ipairs(TIMER_PRESETS) do
+    items[#items + 1] = { kind = "timeropt", secs = preset.secs, label = preset.label }
+  end
+  items[#items + 1] = { kind = "back", label = "[ Cancel ]" }
+  return items
+end
+
+local function buildConfirmItems()
+  local items = {}
+  for _, opt in ipairs(ui.confirm.options) do
+    items[#items + 1] = { kind = "confirmopt", label = opt.label, fn = opt.fn }
+  end
+  return items
+end
+
+local function refreshItems()
+  local s = ui.screen
+  if s == "settings" then
+    ui.items = buildSettingsItems()
+  elseif s == "edit" then
+    ui.items = buildEditItems()
+  elseif s == "pick_target" then
+    ui.items = buildPickTargetItems()
+  elseif s == "pick_side" then
+    ui.items = buildPickSideItems()
+  elseif s == "integrators" then
+    ui.items = buildIntegratorItems()
+  elseif s == "scan" then
+    ui.items = buildScanItems()
+  elseif s == "pick_timer" then
+    ui.items = buildPickTimerItems()
+  elseif s == "confirm" then
+    ui.items = buildConfirmItems()
+  else
+    ui.items = {}
+  end
+  if ui.sel > #ui.items then ui.sel = math.max(1, #ui.items) end
+end
+
+-- ---------------------------------------------------------------------
+-- navigation
+-- ---------------------------------------------------------------------
+
+local PARENT = {
+  settings = "main",
+  edit = "settings",
+  pick_target = "edit",
+  pick_side = "edit",
+  integrators = "settings",
+  scan = "integrators",
+  pick_timer = "main",
+}
+
+local function openScreen(name)
+  ui.screen = name
+  ui.sel = 1
+  ui.scroll = 0
+  refreshItems()
+  redraw()
+end
+
+local function openConfirm(title, lines, options, backTo)
+  ui.confirm = { title = title, lines = lines, options = options, backTo = backTo }
+  openScreen("confirm")
+end
+
+local function openInput(title, prompt, initial, onSubmit, backTo)
+  ui.input = {
+    title = title,
+    prompt = prompt,
+    buffer = initial or "",
+    onSubmit = onSubmit,
+    backTo = backTo,
+  }
+  ui.screen = "input"
+  redraw()
+end
+
+local function finishInput(text)
+  local inp = ui.input
+  ui.input = nil
+  openScreen(inp.backTo)
+  -- text is nil when the entry was cancelled; the callback only runs on
+  -- an accepted entry
+  if text ~= nil and inp.onSubmit then inp.onSubmit(text) end
+  refreshItems()
+  redraw()
+end
+
+local function goBack()
+  local s = ui.screen
+  if s == "input" then
+    finishInput(nil)
+  elseif s == "confirm" then
+    local backTo = (ui.confirm and ui.confirm.backTo) or "settings"
+    ui.confirm = nil
+    openScreen(backTo)
+  elseif PARENT[s] then
+    openScreen(PARENT[s])
+  end
+end
+
+-- ---------------------------------------------------------------------
+-- actions
+-- ---------------------------------------------------------------------
+
+local function toggleSpawner(i)
+  local sp = config.spawners[i]
+  if not sp then return end
+  -- a manual toggle always cancels a running countdown; toggling on this
+  -- way means "on indefinitely"
+  cancelSpawnerTimer(sp)
+  sp.state = not sp.state
+  applyOutput(sp)
+  saveConfig()
+  if sp.target == "none" then
+    ui.status = sp.name .. " has no output assigned"
+  elseif spawnerOffline(sp) then
+    ui.status = sp.name .. ": output offline!"
+  end
+  redraw()
+end
+
+local function startSpawnerTimer(i, secs)
+  local sp = config.spawners[i]
+  if not sp then return end
+  sp.state = true
+  timerEnds[sp] = os.clock() + secs
+  applyOutput(sp)
+  saveConfig()
+  ensureTick()
+  ui.status = sp.name .. " on for " .. formatCountdown(secs)
+end
+
+-- fires once a second while any countdown is running: turns off expired
+-- spawners and refreshes the countdown display
+local function onTick()
+  local now = os.clock()
+  local expired = {}
+  for sp, endT in pairs(timerEnds) do
+    if endT <= now then expired[#expired + 1] = sp end
+  end
+  for _, sp in ipairs(expired) do
+    cancelSpawnerTimer(sp)
+    sp.state = false
+    applyOutput(sp)
+    ui.status = sp.name .. " timer done - turned off"
+  end
+  if #expired > 0 then saveConfig() end
+  ensureTick()
+  if ui.screen == "main" then redraw() end
+end
+
+local function activate(it)
+  local k = it.kind
+  local sp = config.spawners[ui.editIndex]
+  if k == "noop" then
+    return
+  elseif k == "back" then
+    goBack()
+  elseif k == "spawner" then
+    ui.editIndex = it.index
+    openScreen("edit")
+  elseif k == "add" then
+    -- new spawners start unassigned so adding one never flips a face of
+    -- the computer that might already be wired to something
+    table.insert(config.spawners, {
+      name = "Spawner " .. tostring(#config.spawners + 1),
+      target = "none",
+      side = "none",
+      inverted = false,
+      state = false,
+    })
+    saveConfig()
+    ui.editIndex = #config.spawners
+    ui.status = "spawner added - set a name and target"
+    openScreen("edit")
+  elseif k == "integrators" then
+    openScreen("integrators")
+  elseif k == "rename" then
+    if sp then
+      openInput("Rename spawner", "New name:", sp.name, function(text)
+        if text ~= "" then
+          sp.name = truncate(text, MAX_NAME_LEN)
+          saveConfig()
+        end
+      end, "edit")
+    end
+  elseif k == "target" then
+    if sp then openScreen("pick_target") end
+  elseif k == "side" then
+    if sp then
+      if sp.target == "none" then
+        ui.status = "assign a target first"
+        redraw()
+      else
+        openScreen("pick_side")
+      end
+    end
+  elseif k == "inverted" then
+    if sp then
+      sp.inverted = not sp.inverted
+      -- the same logical state now needs the opposite electrical level
+      applyOutput(sp)
+      saveConfig()
+      refreshItems()
+      redraw()
+    end
+  elseif k == "remove" then
+    if sp then
+      openConfirm("Remove spawner",
+        { "Remove \"" .. sp.name .. "\"?", "Its output will be turned off." },
+        {
+          { label = "Remove", fn = function()
+              cancelSpawnerTimer(sp)
+              forceLogicalOff(sp)
+              for i, s in ipairs(config.spawners) do
+                if s == sp then
+                  table.remove(config.spawners, i)
+                  break
+                end
+              end
+              applyFailed[sp] = nil
+              saveConfig()
+              if ui.mainSel > #config.spawners then
+                ui.mainSel = math.max(1, #config.spawners)
+              end
+              ui.editIndex = nil
+              ui.status = "spawner removed"
+              openScreen("settings")
+            end },
+          { label = "Cancel", fn = function() openScreen("edit") end },
+        }, "edit")
+    end
+  elseif k == "targetopt" then
+    if sp then
+      -- release the face we are leaving before pointing anywhere else
+      forceLogicalOff(sp)
+      sp.target = it.value
+      if it.value == "none" then
+        sp.side = "none"
+        saveConfig()
+        openScreen("edit")
+      else
+        if not isValidSide(sp.target, sp.side) then
+          sp.side = sidesFor(sp.target)[1]
+        end
+        applyOutput(sp)
+        saveConfig()
+        -- go straight to the side picker so the side is a conscious choice
+        openScreen("pick_side")
+      end
+    end
+  elseif k == "sideopt" then
+    if sp then
+      forceLogicalOff(sp)
+      sp.side = it.value
+      applyOutput(sp)
+      saveConfig()
+      openScreen("edit")
+    end
+  elseif k == "integ" then
+    local name = it.name
+    local users = {}
+    for _, s in ipairs(config.spawners) do
+      if s.target == name then users[#users + 1] = s end
+    end
+    if #users == 0 then
+      openConfirm("Remove integrator", { "Remove \"" .. name .. "\"?" }, {
+        { label = "Remove", fn = function()
+            removeIntegratorByName(name)
+            saveConfig()
+            ui.status = "integrator removed"
+            openScreen("integrators")
+          end },
+        { label = "Cancel", fn = function() openScreen("integrators") end },
+      }, "integrators")
+    else
+      -- never leave dangling references: removal reassigns the affected
+      -- spawners to an explicit unassigned state, off
+      openConfirm("Integrator is in use",
+        { "\"" .. name .. "\" is used by " .. tostring(#users) .. " spawner(s)." },
+        {
+          { label = "Turn them off, unassign, and remove", fn = function()
+              for _, s in ipairs(users) do
+                cancelSpawnerTimer(s)
+                forceLogicalOff(s)
+                s.state = false
+                s.target = "none"
+                s.side = "none"
+                applyFailed[s] = nil
+              end
+              removeIntegratorByName(name)
+              saveConfig()
+              ui.status = "removed; spawners set to unassigned"
+              openScreen("integrators")
+            end },
+          { label = "Cancel", fn = function() openScreen("integrators") end },
+        }, "integrators")
+    end
+  elseif k == "scan" then
+    openScreen("scan")
+  elseif k == "rescan" then
+    refreshItems()
+    redraw()
+  elseif k == "manual" then
+    openInput("Add integrator", "Peripheral name:", "", function(text)
+      if text == "" then return end
+      if knownIntegrator(text) then
+        ui.status = "already in the list"
+      elseif peripheral.isPresent(text)
+        and peripheral.getType(text) ~= "redstone_integrator" then
+        ui.status = "that peripheral is not a redstone_integrator"
+      else
+        table.insert(config.integrators, text)
+        saveConfig()
+        if peripheral.isPresent(text) then
+          ui.status = "integrator added"
+        else
+          ui.status = "added (not currently attached)"
+        end
+      end
+    end, "integrators")
+  elseif k == "found" then
+    table.insert(config.integrators, it.name)
+    saveConfig()
+    ui.status = "added " .. it.name
+    refreshItems()
+    redraw()
+  elseif k == "timeropt" then
+    startSpawnerTimer(ui.timerIndex, it.secs)
+    openScreen("main")
+  elseif k == "confirmopt" then
+    local fn = it.fn
+    ui.confirm = nil
+    fn()
+  end
+end
+
+-- ---------------------------------------------------------------------
+-- input handling (one event loop owns everything; no read())
+-- ---------------------------------------------------------------------
+
+local function handleMainKey(code)
+  local n = #config.spawners
+  if code == keys.up then
+    if n > 0 and ui.mainSel > 1 then
+      ui.mainSel = ui.mainSel - 1
+      clampMainScroll()
+      redraw()
+    end
+  elseif code == keys.down then
+    if n > 0 and ui.mainSel < n then
+      ui.mainSel = ui.mainSel + 1
+      clampMainScroll()
+      redraw()
+    end
+  elseif code == keys.space then
+    if n > 0 then toggleSpawner(ui.mainSel) end
+  end
+end
+
+local function handleMenuKey(code)
+  if code == keys.up then
+    if ui.sel > 1 then
+      ui.sel = ui.sel - 1
+      clampMenuScroll()
+      redraw()
+    end
+  elseif code == keys.down then
+    if ui.sel < #ui.items then
+      ui.sel = ui.sel + 1
+      clampMenuScroll()
+      redraw()
+    end
+  elseif code == keys.enter then
+    local it = ui.items[ui.sel]
+    if it then activate(it) end
+  elseif code == keys.backspace then
+    goBack()
+  elseif code == keys.space then
+    -- convenience: space also flips the inverted flag when selected
+    local it = ui.items[ui.sel]
+    if it and it.kind == "inverted" then activate(it) end
+  end
+end
+
+local function handleInputKey(code)
+  if code == keys.enter then
+    finishInput(ui.input.buffer)
+  elseif code == keys.backspace then
+    if #ui.input.buffer > 0 then
+      ui.input.buffer = string.sub(ui.input.buffer, 1, -2)
+      redraw()
+    else
+      finishInput(nil)
+    end
+  end
+end
+
+local function handleKey(code)
+  if ui.screen == "main" then
+    handleMainKey(code)
+  elseif ui.screen == "input" then
+    handleInputKey(code)
+  else
+    handleMenuKey(code)
+  end
+end
+
+local function handleChar(ch)
+  if ui.screen == "input" then
+    if #ui.input.buffer < MAX_INPUT_LEN then
+      ui.input.buffer = ui.input.buffer .. ch
+      redraw()
+    end
+  elseif ui.screen == "main" then
+    if ch == "a" or ch == "A" or ch == "s" or ch == "S" then
+      openScreen("settings")
+    elseif ch == "t" or ch == "T" then
+      if #config.spawners > 0 then
+        ui.timerIndex = ui.mainSel
+        openScreen("pick_timer")
+      end
+    end
+  end
+end
+
+local function handleTouch(name, x, y)
+  if name ~= monName then return end
+  if ui.screen ~= "main" then
+    -- the monitor shows a notice while settings are open; ignore taps
+    return
+  end
+  local i = monRowMap[y]
+  if i and config.spawners[i] then
+    -- move the terminal selection too so both displays stay in step
+    ui.mainSel = i
+    clampMainScroll()
+    toggleSpawner(i)
+    return
+  end
+  if monSettingsY and y == monSettingsY then
+    openScreen("settings")
+  end
+end
+
+local function onPeripheralChange()
+  findMonitor()
+  -- reapply everything: a reattached integrator comes back with its
+  -- outputs reset, and the pcall failures refresh each spawner's
+  -- offline flag
+  applyAll()
+  if ui.screen ~= "main" and ui.screen ~= "input" and ui.screen ~= "confirm" then
+    refreshItems()
+  end
+  redraw()
+end
+
+-- ---------------------------------------------------------------------
+-- main loop
+-- ---------------------------------------------------------------------
+
+local function eventLoop()
+  while true do
+    -- os.pullEvent (not pullEventRaw) so ctrl+t terminates normally;
+    -- the pcall around main() turns that into a clean exit
+    local ev, a, b, c = os.pullEvent()
+    if ev == "key" then
+      ui.status = nil
+      handleKey(a)
+    elseif ev == "char" then
+      handleChar(a)
+    elseif ev == "monitor_touch" then
+      ui.status = nil
+      handleTouch(a, b, c)
+    elseif ev == "timer" then
+      if a == tickTimerId then
+        tickTimerId = nil
+        onTick()
+      end
+    elseif ev == "peripheral" or ev == "peripheral_detach" then
+      onPeripheralChange()
+    elseif ev == "monitor_resize" then
+      findMonitor()
+      redraw()
+    elseif ev == "term_resize" then
+      if ui.screen == "main" then clampMainScroll() else clampMenuScroll() end
+      redraw()
+    end
+  end
+end
+
+local function main()
+  loadConfig()
+  -- resume any countdown that was running when we last saved; it picks
+  -- up from the remaining time recorded at that save
+  for _, sp in ipairs(config.spawners) do
+    if type(sp.timerLeft) == "number" and sp.timerLeft > 0 and sp.state then
+      timerEnds[sp] = os.clock() + sp.timerLeft
+    else
+      sp.timerLeft = nil
+    end
+  end
+  ensureTick()
+  findMonitor()
+  -- a reboot clears every redstone output, so restore each saved state
+  -- before drawing anything; this restore is why the file is "startup"
+  applyAll()
+  redraw()
+  eventLoop()
+end
+
+local ok, err = pcall(main)
+
+-- always restore the terminal, whether we stopped via ctrl+t or a bug
+if term.isColor() then
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.white)
+end
+term.clear()
+term.setCursorPos(1, 1)
+-- setCursorBlink is core term api in every cc version; pcall just in case
+pcall(term.setCursorBlink, true)
+
+if mon then
+  pcall(function()
+    if monColor then
+      mon.setBackgroundColor(colors.black)
+      mon.setTextColor(colors.white)
+    end
+    mon.clear()
+    mon.setCursorPos(1, 1)
+    mon.write("panel stopped")
+  end)
+end
+
+if not ok then
+  if tostring(err) == "Terminated" then
+    print("Spawner panel terminated.")
+  else
+    print("Spawner panel crashed:")
+    print(tostring(err))
+  end
+  print("Outputs keep their last state until reboot.")
+end
