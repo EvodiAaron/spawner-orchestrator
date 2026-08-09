@@ -60,7 +60,8 @@ integrators attached.
    cable, then right-click each modem so it lights up red.
 3. On the panel: **A** (settings) → **Manage integrators** →
    **Scan for integrators**, and add the one that appears
-   (e.g. `redstone_integrator_0`).
+   (e.g. `redstone_integrator_0`). Selecting a known integrator lets you
+   give it a friendly label ("cave wall") or remove it.
 4. Back in settings, add a spawner, set its target to that integrator, pick
    the side facing the spawner, and set **Inverted** to match the spawner's
    own redstone mode (active with signal vs. active without signal). The
@@ -104,10 +105,27 @@ The choice is saved in the config and survives reboots.
 **One-off timer** — press **T** on a spawner to run it for a picked
 duration regardless of the default mode.
 
+**Ignore Timer** — each spawner has an "Ignore timer" option in settings.
+When set, no timer ever attaches to it: it always stays on until switched
+off manually, regardless of the default mode or Toggle All.
+
 Either way the countdown shows on both displays and the spawner switches
 itself off at zero. A manual toggle cancels a running countdown.
 Countdowns survive reboots, resuming from the remaining time recorded at
 the last save.
+
+## Per-spawner options and layout
+
+Each spawner's settings screen also offers:
+
+- **Menu position (Top/Bottom)** — Bottom spawners render as a group
+  anchored to the bottom of the monitor, just above the `[ Toggle All ]`
+  button (when the list is too long to fit, it falls back to one scrolled
+  list). On the terminal, Bottom spawners simply sort after the Top group.
+- **Move up / Move down** — reorder spawners within the list.
+
+The header bar colour on both displays is selectable in settings
+(**Header colour**), with a picker that previews each colour.
 
 ## Persistence
 

@@ -46,6 +46,13 @@
 --   the default timer. settings are terminal-only. the monitor picks
 --   the largest text scale that still fits the list.
 --
+-- per-spawner options (settings -> spawner): ignore timer (always stays
+--   on, no countdowns ever attach), menu position top/bottom (bottom
+--   rows anchor above the monitor's buttons), move up/down to reorder.
+-- integrators can be given labels (settings -> manage integrators ->
+--   pick one -> set label). the header bar colour is also picked in
+--   settings. everything persists in the config file.
+--
 -- config lives in "config" next to this program; a corrupt file is
 -- moved to "config.bak" and the panel starts fresh.
 -- =====================================================================
@@ -83,6 +90,24 @@ local TIMER_MODES = {
   { secs = 1800, label = "30m" },
   { secs = 3600, label = "1h" },
   { secs = 7200, label = "2h" },
+}
+
+-- header bar colours selectable in settings; text colour is picked for
+-- contrast against each background
+local HEADER_COLORS = {
+  { name = "blue", color = colors.blue, text = colors.white },
+  { name = "red", color = colors.red, text = colors.white },
+  { name = "green", color = colors.green, text = colors.white },
+  { name = "purple", color = colors.purple, text = colors.white },
+  { name = "brown", color = colors.brown, text = colors.white },
+  { name = "gray", color = colors.gray, text = colors.white },
+  { name = "cyan", color = colors.cyan, text = colors.black },
+  { name = "magenta", color = colors.magenta, text = colors.black },
+  { name = "orange", color = colors.orange, text = colors.black },
+  { name = "lime", color = colors.lime, text = colors.black },
+  { name = "yellow", color = colors.yellow, text = colors.black },
+  { name = "pink", color = colors.pink, text = colors.black },
+  { name = "lightBlue", color = colors.lightBlue, text = colors.black },
 }
 
 -- sides on the computer itself are relative to the block
@@ -188,6 +213,37 @@ local function timerModeLabel()
   return formatCountdown(mode)
 end
 
+-- background and text colour for the header bars
+local function headerStyle()
+  local wanted = (config and config.headerColor) or "blue"
+  for _, c in ipairs(HEADER_COLORS) do
+    if c.name == wanted then return c.color, c.text end
+  end
+  return colors.blue, colors.white
+end
+
+-- user label for an integrator, with the peripheral name kept visible
+local function integLabel(name)
+  local l = config.integratorLabels and config.integratorLabels[name]
+  if l and l ~= "" then
+    return l .. " (" .. name .. ")"
+  end
+  return name
+end
+
+-- main-screen display order: "top" spawners in config order, then the
+-- "bottom" group (rendered anchored to the bottom on the monitor)
+local function displayOrder()
+  local order = {}
+  for i, sp in ipairs(config.spawners) do
+    if sp.pos ~= "bottom" then order[#order + 1] = i end
+  end
+  for i, sp in ipairs(config.spawners) do
+    if sp.pos == "bottom" then order[#order + 1] = i end
+  end
+  return order
+end
+
 -- only touch colours on colour-capable displays; basic displays keep
 -- their white-on-black defaults and rely on text markers instead
 local function setColors(t, fg, bg)
@@ -202,7 +258,14 @@ end
 -- ---------------------------------------------------------------------
 
 local function defaultConfig()
-  return { version = 1, spawners = {}, integrators = {}, timerMode = 0 }
+  return {
+    version = 1,
+    spawners = {},
+    integrators = {},
+    integratorLabels = {},
+    timerMode = 0,
+    headerColor = "blue",
+  }
 end
 
 local function validSpawner(sp)
@@ -214,6 +277,10 @@ local function validSpawner(sp)
   if type(sp.state) ~= "boolean" then return false end
   -- optional field: seconds left on a running countdown at save time
   if sp.timerLeft ~= nil and type(sp.timerLeft) ~= "number" then return false end
+  -- optional field: never attach timers to this spawner
+  if sp.ignoreTimer ~= nil and type(sp.ignoreTimer) ~= "boolean" then return false end
+  -- optional field: where the row renders on the main screen
+  if sp.pos ~= nil and sp.pos ~= "top" and sp.pos ~= "bottom" then return false end
   if sp.target == "none" then return sp.side == "none" end
   return isValidSide(sp.target, sp.side)
 end
@@ -224,8 +291,17 @@ local function validConfig(c)
   if c.version ~= 1 then return false end
   if type(c.spawners) ~= "table" then return false end
   if type(c.integrators) ~= "table" then return false end
-  -- optional field: default timer in seconds, 0 = indefinite
+  -- optional field: default timer in seconds, 0 = no timer
   if c.timerMode ~= nil and type(c.timerMode) ~= "number" then return false end
+  -- optional field: header bar colour name
+  if c.headerColor ~= nil and type(c.headerColor) ~= "string" then return false end
+  -- optional field: user labels for integrators, keyed by peripheral name
+  if c.integratorLabels ~= nil then
+    if type(c.integratorLabels) ~= "table" then return false end
+    for k, v in pairs(c.integratorLabels) do
+      if type(k) ~= "string" or type(v) ~= "string" then return false end
+    end
+  end
   for _, sp in ipairs(c.spawners) do
     if not validSpawner(sp) then return false end
   end
@@ -277,8 +353,9 @@ local function loadConfig()
   if text then data = textutils.unserialize(text) end
   if validConfig(data) then
     config = data
-    -- older configs predate the default-timer field
+    -- older configs predate these optional fields
     if type(config.timerMode) ~= "number" then config.timerMode = 0 end
+    if type(config.integratorLabels) ~= "table" then config.integratorLabels = {} end
   else
     -- unreadable or wrong shape: keep it for inspection, start fresh
     if fs.exists(CONFIG_BAK) then fs.delete(CONFIG_BAK) end
@@ -415,6 +492,7 @@ local function findMonitor()
 end
 
 local function removeIntegratorByName(name)
+  if config.integratorLabels then config.integratorLabels[name] = nil end
   for i, n in ipairs(config.integrators) do
     if n == name then
       table.remove(config.integrators, i)
@@ -481,7 +559,8 @@ local function drawTooSmall(t, w, h)
 end
 
 local function drawTitleBar(t, w, title)
-  setColors(t, colors.white, colors.blue)
+  local bg, fg = headerStyle()
+  setColors(t, fg, bg)
   t.setCursorPos(1, 1)
   t.clearLine()
   t.setCursorPos(2, 1)
@@ -515,12 +594,13 @@ local function drawTermMain()
     t.setCursorPos(2, 4)
     t.write("press A to open settings")
   else
+    local order = displayOrder()
     for row = 1, listH do
-      local i = ui.mainScroll + row
-      if i > n then break end
-      local sp = config.spawners[i]
+      local p = ui.mainScroll + row
+      if p > n then break end
+      local sp = config.spawners[order[p]]
       local y = 2 + row
-      local selected = (i == ui.mainSel)
+      local selected = (p == ui.mainSel)
       if selected then
         setColors(t, colors.white, colors.gray)
         t.setCursorPos(1, y)
@@ -614,6 +694,8 @@ local function drawTermMenu(title)
     t.write(selected and ">" or " ")
     if it.dim and not selected and t.isColor() then
       t.setTextColor(colors.lightGray)
+    elseif it.fg and t.isColor() then
+      t.setTextColor(it.fg)
     end
     t.setCursorPos(3, y)
     t.write(truncate(it.label, w - 4))
@@ -727,6 +809,8 @@ local function drawTerm()
     elseif s == "pick_timer" then
       local sp = config.spawners[ui.timerIndex]
       title = "Timer: " .. (sp and sp.name or "?")
+    elseif s == "pick_color" then
+      title = "Header colour"
     elseif s == "integrators" then
       title = "Redstone integrators"
     elseif s == "scan" then
@@ -770,8 +854,9 @@ local function drawMonitorRaw()
   -- heading: a full-width bar so it stands out from the list rows
   local title = monColor and "SPAWNERS" or "= SPAWNERS ="
   if monColor then
-    mon.setBackgroundColor(colors.blue)
-    mon.setTextColor(colors.white)
+    local bg, fg = headerStyle()
+    mon.setBackgroundColor(bg)
+    mon.setTextColor(fg)
   end
   mon.setCursorPos(1, 1)
   mon.clearLine()
@@ -788,11 +873,7 @@ local function drawMonitorRaw()
     mon.setCursorPos(2, 2)
     mon.write(truncate("(none configured)", w - 1))
   else
-    for row = 1, listH do
-      local i = ui.mainScroll + row
-      if i > n then break end
-      local sp = config.spawners[i]
-      local y = 1 + row
+    local function drawMonRow(sp, i, y)
       monRowMap[y] = i
       local endT = timerEnds[sp]
       local showTimer = endT and w >= 22
@@ -820,13 +901,42 @@ local function drawMonitorRaw()
       if monColor then mon.setTextColor(colors.white) end
       mon.write("]")
     end
-    if ui.mainScroll > 0 then
-      mon.setCursorPos(w, 2)
-      mon.write("^")
-    end
-    if ui.mainScroll + listH < n then
-      mon.setCursorPos(w, 1 + listH)
-      mon.write("v")
+    local order = displayOrder()
+    if n <= listH then
+      -- everything fits: "top" rows flow from the heading, "bottom"
+      -- rows anchor just above the control buttons
+      local y = 2
+      for _, i in ipairs(order) do
+        local sp = config.spawners[i]
+        if sp.pos ~= "bottom" then
+          drawMonRow(sp, i, y)
+          y = y + 1
+        end
+      end
+      local bottoms = {}
+      for _, i in ipairs(order) do
+        if config.spawners[i].pos == "bottom" then bottoms[#bottoms + 1] = i end
+      end
+      y = (1 + listH) - #bottoms + 1
+      for _, i in ipairs(bottoms) do
+        drawMonRow(config.spawners[i], i, y)
+        y = y + 1
+      end
+    else
+      -- too many rows to fit: contiguous scrolled list, anchoring off
+      for row = 1, listH do
+        local p = ui.mainScroll + row
+        if p > n then break end
+        drawMonRow(config.spawners[order[p]], order[p], 1 + row)
+      end
+      if ui.mainScroll > 0 then
+        mon.setCursorPos(w, 2)
+        mon.write("^")
+      end
+      if ui.mainScroll + listH < n then
+        mon.setCursorPos(w, 1 + listH)
+        mon.write("v")
+      end
     end
   end
   -- touch monitors get a master switch and the default-timer selector;
@@ -864,8 +974,8 @@ end
 local function targetLabel(target)
   if target == "self" then return "self (this computer)" end
   if target == "none" then return "unassigned" end
-  if integratorPresent(target) then return target end
-  return target .. " (offline)"
+  if integratorPresent(target) then return integLabel(target) end
+  return integLabel(target) .. " (offline)"
 end
 
 local function buildSettingsItems()
@@ -875,6 +985,10 @@ local function buildSettingsItems()
   end
   items[#items + 1] = { kind = "add", label = "[ Add spawner ]" }
   items[#items + 1] = { kind = "integrators", label = "[ Manage integrators ]" }
+  items[#items + 1] = {
+    kind = "headercolor",
+    label = "[ Header colour: " .. (config.headerColor or "blue") .. " ]",
+  }
   items[#items + 1] = { kind = "back", label = "[ Back ]" }
   return items
 end
@@ -889,6 +1003,10 @@ local function buildEditItems()
     { kind = "target", label = "Target: " .. targetLabel(sp.target) },
     { kind = "side", label = "Side: " .. sp.side, dim = (sp.target == "none") },
     { kind = "inverted", label = "Inverted: " .. (sp.inverted and "yes" or "no") },
+    { kind = "ignoretimer", label = "Ignore timer: " .. (sp.ignoreTimer and "yes" or "no") },
+    { kind = "pos", label = "Menu position: " .. (sp.pos == "bottom" and "Bottom" or "Top") },
+    { kind = "moveup", label = "[ Move up ]" },
+    { kind = "movedown", label = "[ Move down ]" },
     { kind = "remove", label = "[ Remove spawner ]" },
     { kind = "back", label = "[ Back ]" },
   }
@@ -899,7 +1017,7 @@ local function buildPickTargetItems()
     { kind = "targetopt", value = "self", label = "self (this computer)" },
   }
   for _, name in ipairs(config.integrators) do
-    local label = name
+    local label = integLabel(name)
     if not integratorPresent(name) then label = label .. " (offline)" end
     items[#items + 1] = { kind = "targetopt", value = name, label = label }
   end
@@ -930,7 +1048,7 @@ local function buildIntegratorItems()
     items[#items + 1] = { kind = "noop", label = "(no integrators configured)", dim = true }
   end
   for _, name in ipairs(config.integrators) do
-    local label = name
+    local label = integLabel(name)
     if not integratorPresent(name) then label = label .. " (offline)" end
     items[#items + 1] = { kind = "integ", name = name, label = label }
   end
@@ -951,6 +1069,18 @@ local function buildScanItems()
   end
   items[#items + 1] = { kind = "rescan", label = "[ Rescan ]" }
   items[#items + 1] = { kind = "back", label = "[ Back ]" }
+  return items
+end
+
+local function buildPickColorItems()
+  local items = {}
+  local current = config.headerColor or "blue"
+  for _, c in ipairs(HEADER_COLORS) do
+    local label = c.name
+    if c.name == current then label = label .. "  (current)" end
+    items[#items + 1] = { kind = "coloropt", value = c.name, label = label, fg = c.color }
+  end
+  items[#items + 1] = { kind = "back", label = "[ Cancel ]" }
   return items
 end
 
@@ -987,6 +1117,8 @@ local function refreshItems()
     ui.items = buildScanItems()
   elseif s == "pick_timer" then
     ui.items = buildPickTimerItems()
+  elseif s == "pick_color" then
+    ui.items = buildPickColorItems()
   elseif s == "confirm" then
     ui.items = buildConfirmItems()
   else
@@ -1007,6 +1139,7 @@ local PARENT = {
   integrators = "settings",
   scan = "integrators",
   pick_timer = "main",
+  pick_color = "settings",
 }
 
 local function openScreen(name)
@@ -1069,7 +1202,7 @@ local function toggleSpawner(i)
   -- runs for the default timer mode (0 = on indefinitely)
   cancelSpawnerTimer(sp)
   sp.state = not sp.state
-  if sp.state and (config.timerMode or 0) > 0 then
+  if sp.state and not sp.ignoreTimer and (config.timerMode or 0) > 0 then
     timerEnds[sp] = os.clock() + config.timerMode
     ensureTick()
   end
@@ -1098,7 +1231,7 @@ local function toggleAll()
   for _, sp in ipairs(config.spawners) do
     cancelSpawnerTimer(sp)
     sp.state = newState
-    if newState and (config.timerMode or 0) > 0 then
+    if newState and not sp.ignoreTimer and (config.timerMode or 0) > 0 then
       timerEnds[sp] = os.clock() + config.timerMode
     end
     applyOutput(sp)
@@ -1130,6 +1263,14 @@ end
 local function startSpawnerTimer(i, secs)
   local sp = config.spawners[i]
   if not sp then return end
+  if sp.ignoreTimer then
+    -- this spawner never takes a timer; just make sure it is on
+    sp.state = true
+    applyOutput(sp)
+    saveConfig()
+    ui.status = sp.name .. " ignores timers - turned on"
+    return
+  end
   sp.state = true
   timerEnds[sp] = os.clock() + secs
   applyOutput(sp)
@@ -1176,6 +1317,8 @@ local function activate(it)
       side = "none",
       inverted = false,
       state = false,
+      ignoreTimer = false,
+      pos = "top",
     })
     saveConfig()
     ui.editIndex = #config.spawners
@@ -1211,6 +1354,38 @@ local function activate(it)
       saveConfig()
       refreshItems()
       redraw()
+    end
+  elseif k == "ignoretimer" then
+    if sp then
+      sp.ignoreTimer = not sp.ignoreTimer
+      -- an already-running countdown would defeat the point
+      if sp.ignoreTimer then cancelSpawnerTimer(sp) end
+      saveConfig()
+      refreshItems()
+      redraw()
+    end
+  elseif k == "pos" then
+    if sp then
+      sp.pos = (sp.pos == "bottom") and "top" or "bottom"
+      saveConfig()
+      refreshItems()
+      redraw()
+    end
+  elseif k == "moveup" or k == "movedown" then
+    if sp then
+      local i = ui.editIndex
+      local j = (k == "moveup") and i - 1 or i + 1
+      if config.spawners[j] then
+        config.spawners[i], config.spawners[j] = config.spawners[j], config.spawners[i]
+        ui.editIndex = j
+        saveConfig()
+        ui.status = "moved to position " .. tostring(j)
+        refreshItems()
+        redraw()
+      else
+        ui.status = "already at the " .. ((k == "moveup") and "top" or "bottom")
+        redraw()
+      end
     end
   elseif k == "remove" then
     if sp then
@@ -1266,6 +1441,26 @@ local function activate(it)
       openScreen("edit")
     end
   elseif k == "integ" then
+    local name = it.name
+    openConfirm("Integrator", { integLabel(name) }, {
+      { label = "Set label", fn = function()
+          local current = (config.integratorLabels and config.integratorLabels[name]) or ""
+          openInput("Label integrator", "Label (empty clears it):", current, function(text)
+            if not config.integratorLabels then config.integratorLabels = {} end
+            if text == "" then
+              config.integratorLabels[name] = nil
+              ui.status = "label cleared"
+            else
+              config.integratorLabels[name] = truncate(text, MAX_NAME_LEN)
+              ui.status = "label saved"
+            end
+            saveConfig()
+          end, "integrators")
+        end },
+      { label = "Remove", fn = function() activate({ kind = "integremove", name = name }) end },
+      { label = "Cancel", fn = function() openScreen("integrators") end },
+    }, "integrators")
+  elseif k == "integremove" then
     local name = it.name
     local users = {}
     for _, s in ipairs(config.spawners) do
@@ -1336,6 +1531,13 @@ local function activate(it)
   elseif k == "timeropt" then
     startSpawnerTimer(ui.timerIndex, it.secs)
     openScreen("main")
+  elseif k == "headercolor" then
+    openScreen("pick_color")
+  elseif k == "coloropt" then
+    config.headerColor = it.value
+    saveConfig()
+    ui.status = "header colour: " .. it.value
+    openScreen("settings")
   elseif k == "confirmopt" then
     local fn = it.fn
     ui.confirm = nil
@@ -1362,7 +1564,7 @@ local function handleMainKey(code)
       redraw()
     end
   elseif code == keys.space then
-    if n > 0 then toggleSpawner(ui.mainSel) end
+    if n > 0 then toggleSpawner(displayOrder()[ui.mainSel]) end
   elseif code == keys.tab then
     toggleAll()
   end
@@ -1387,9 +1589,11 @@ local function handleMenuKey(code)
   elseif code == keys.backspace then
     goBack()
   elseif code == keys.space then
-    -- convenience: space also flips the inverted flag when selected
+    -- convenience: space also flips yes/no style fields when selected
     local it = ui.items[ui.sel]
-    if it and it.kind == "inverted" then activate(it) end
+    if it and (it.kind == "inverted" or it.kind == "ignoretimer" or it.kind == "pos") then
+      activate(it)
+    end
   end
 end
 
@@ -1427,7 +1631,7 @@ local function handleChar(ch)
       openScreen("settings")
     elseif ch == "t" or ch == "T" then
       if #config.spawners > 0 then
-        ui.timerIndex = ui.mainSel
+        ui.timerIndex = displayOrder()[ui.mainSel]
         openScreen("pick_timer")
       end
     elseif ch == "m" or ch == "M" then
@@ -1445,7 +1649,12 @@ local function handleTouch(name, x, y)
   local i = monRowMap[y]
   if i and config.spawners[i] then
     -- move the terminal selection too so both displays stay in step
-    ui.mainSel = i
+    for p, ci in ipairs(displayOrder()) do
+      if ci == i then
+        ui.mainSel = p
+        break
+      end
+    end
     clampMainScroll()
     toggleSpawner(i)
     return
@@ -1510,7 +1719,8 @@ local function main()
   -- resume any countdown that was running when we last saved; it picks
   -- up from the remaining time recorded at that save
   for _, sp in ipairs(config.spawners) do
-    if type(sp.timerLeft) == "number" and sp.timerLeft > 0 and sp.state then
+    if type(sp.timerLeft) == "number" and sp.timerLeft > 0 and sp.state
+      and not sp.ignoreTimer then
       timerEnds[sp] = os.clock() + sp.timerLeft
     else
       sp.timerLeft = nil
