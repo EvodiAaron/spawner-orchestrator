@@ -105,6 +105,13 @@ The choice is saved in the config and survives reboots.
 **One-off timer** — press **T** on a spawner to run it for a picked
 duration regardless of the default mode.
 
+**Interval mode** — each spawner can optionally pulse instead of holding a
+steady on state: pick an interval in settings (1s, 3s, 5s, 10s, 15s, 30s,
+60s, 120s) and, while the spawner is on, its output cycles that long on,
+then that long off, starting with the on phase. The row still reads **ON**,
+but the text shades faintly during the off half of the pulse so you can see
+the phase at a glance. Set the interval back to "off" for a steady signal.
+
 **Ignore Timer** — each spawner has an "Ignore timer" option in settings.
 When set, no timer ever attaches to it: it always stays on until switched
 off manually, regardless of the default mode or Toggle All.

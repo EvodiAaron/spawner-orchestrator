@@ -46,8 +46,10 @@
 --   the default timer. settings are terminal-only. the monitor picks
 --   the largest text scale that still fits the list.
 --
--- per-spawner options (settings -> spawner): ignore timer (always stays
---   on, no countdowns ever attach), bypass toggle all (the master
+-- per-spawner options (settings -> spawner): interval mode (while on,
+--   the output pulses n seconds on / n seconds off; the row still reads
+--   ON but shades faintly during the off half), ignore timer (always
+--   stays on, no countdowns ever attach), bypass toggle all (the master
 --   switch skips it), menu position top/bottom (bottom rows anchor
 --   above the monitor's buttons), move up/down to reorder. reordering
 --   also works bios-style in the settings list itself: select a
@@ -94,6 +96,10 @@ local TIMER_MODES = {
   { secs = 3600, label = "1h" },
   { secs = 7200, label = "2h" },
 }
+
+-- interval-mode pulse lengths offered per spawner (seconds on, then the
+-- same off, repeating while the spawner is on)
+local INTERVAL_PRESETS = { 1, 3, 5, 10, 15, 30, 60, 120 }
 
 -- header bar colours selectable in settings; text colour is picked for
 -- contrast against each background
@@ -153,6 +159,12 @@ local applyFailed = {}
 local timerEnds = {}
 local tickTimerId = nil
 
+-- runtime-only interval-mode state: phase true = the on half of the
+-- pulse; next flip deadlines are os.clock() based. a reboot restarts an
+-- active interval spawner at the on phase
+local intervalPhase = {}
+local intervalNext = {}
+
 -- monitor state
 local mon, monName
 local monColor = false
@@ -196,9 +208,18 @@ local function formatCountdown(secs)
   return string.format("%d:%02d", m, s)
 end
 
--- keep exactly one 1-second os.startTimer alive while any countdown runs
+local function anyIntervalActive()
+  if not config then return false end
+  for _, sp in ipairs(config.spawners) do
+    if sp.state and (sp.interval or 0) > 0 then return true end
+  end
+  return false
+end
+
+-- keep exactly one 1-second os.startTimer alive while any countdown or
+-- interval pulse is running
 local function ensureTick()
-  if next(timerEnds) ~= nil and tickTimerId == nil then
+  if tickTimerId == nil and (next(timerEnds) ~= nil or anyIntervalActive()) then
     tickTimerId = os.startTimer(1)
   end
 end
@@ -206,6 +227,17 @@ end
 local function cancelSpawnerTimer(sp)
   timerEnds[sp] = nil
   sp.timerLeft = nil
+end
+
+-- begin an interval pulse at the on phase
+local function startInterval(sp)
+  intervalPhase[sp] = true
+  intervalNext[sp] = os.clock() + sp.interval
+end
+
+local function stopInterval(sp)
+  intervalPhase[sp] = nil
+  intervalNext[sp] = nil
 end
 
 local function timerModeLabel()
@@ -286,6 +318,8 @@ local function validSpawner(sp)
   if sp.pos ~= nil and sp.pos ~= "top" and sp.pos ~= "bottom" then return false end
   -- optional field: the toggle-all master switch skips this spawner
   if sp.bypassAll ~= nil and type(sp.bypassAll) ~= "boolean" then return false end
+  -- optional field: pulse length in seconds; nil/0 = plain on state
+  if sp.interval ~= nil and type(sp.interval) ~= "number" then return false end
   if sp.target == "none" then return sp.side == "none" end
   return isValidSide(sp.target, sp.side)
 end
@@ -374,10 +408,15 @@ end
 -- redstone output
 -- ---------------------------------------------------------------------
 
--- write the spawner's logical state to its output, honouring polarity
+-- write the spawner's logical state to its output, honouring polarity.
+-- an on spawner in interval mode emits its current pulse phase instead
+-- of a steady level
 local function applyOutput(sp)
   if sp.target == "none" then return end
   local physical = sp.state
+  if physical and (sp.interval or 0) > 0 then
+    physical = intervalPhase[sp] ~= false
+  end
   if sp.inverted then physical = not physical end
   local ok
   if sp.target == "self" then
@@ -550,7 +589,14 @@ end
 
 local function spawnerStatusText(sp)
   if sp.target == "none" then return "---", colors.lightGray end
-  if sp.state then return "ON", colors.lime end
+  if sp.state then
+    -- interval mode still reads ON, but faintly during the off half of
+    -- the pulse so the current phase is visible at a glance
+    if (sp.interval or 0) > 0 and intervalPhase[sp] == false then
+      return "ON", colors.green
+    end
+    return "ON", colors.lime
+  end
   return "OFF", colors.red
 end
 
@@ -816,6 +862,9 @@ local function drawTerm()
       title = "Timer: " .. (sp and sp.name or "?")
     elseif s == "pick_color" then
       title = "Header colour"
+    elseif s == "pick_interval" then
+      local sp = config.spawners[ui.editIndex]
+      title = "Interval: " .. (sp and sp.name or "?")
     elseif s == "integrators" then
       title = "Redstone integrators"
     elseif s == "scan" then
@@ -1012,6 +1061,8 @@ local function buildEditItems()
     { kind = "target", label = "Target: " .. targetLabel(sp.target) },
     { kind = "side", label = "Side: " .. sp.side, dim = (sp.target == "none") },
     { kind = "inverted", label = "Inverted: " .. (sp.inverted and "yes" or "no") },
+    { kind = "interval", label = "Interval: "
+      .. ((sp.interval or 0) > 0 and (sp.interval .. "s on / " .. sp.interval .. "s off") or "off") },
     { kind = "ignoretimer", label = "Ignore timer: " .. (sp.ignoreTimer and "yes" or "no") },
     { kind = "bypassall", label = "Bypass Toggle All: " .. (sp.bypassAll and "yes" or "no") },
     { kind = "pos", label = "Menu position: " .. (sp.pos == "bottom" and "Bottom" or "Top") },
@@ -1082,6 +1133,24 @@ local function buildScanItems()
   return items
 end
 
+local function buildPickIntervalItems()
+  local sp = config.spawners[ui.editIndex]
+  local current = sp and (sp.interval or 0) or 0
+  local items = {
+    { kind = "intervalopt", secs = 0,
+      label = "off (steady on)" .. (current == 0 and "  (current)" or "") },
+  }
+  for _, secs in ipairs(INTERVAL_PRESETS) do
+    items[#items + 1] = {
+      kind = "intervalopt",
+      secs = secs,
+      label = secs .. "s on / " .. secs .. "s off" .. (current == secs and "  (current)" or ""),
+    }
+  end
+  items[#items + 1] = { kind = "back", label = "[ Cancel ]" }
+  return items
+end
+
 local function buildPickColorItems()
   local items = {}
   local current = config.headerColor or "blue"
@@ -1129,6 +1198,8 @@ local function refreshItems()
     ui.items = buildPickTimerItems()
   elseif s == "pick_color" then
     ui.items = buildPickColorItems()
+  elseif s == "pick_interval" then
+    ui.items = buildPickIntervalItems()
   elseif s == "confirm" then
     ui.items = buildConfirmItems()
   else
@@ -1150,6 +1221,7 @@ local PARENT = {
   scan = "integrators",
   pick_timer = "main",
   pick_color = "settings",
+  pick_interval = "edit",
 }
 
 local function openScreen(name)
@@ -1214,8 +1286,13 @@ local function toggleSpawner(i)
   sp.state = not sp.state
   if sp.state and not sp.ignoreTimer and (config.timerMode or 0) > 0 then
     timerEnds[sp] = os.clock() + config.timerMode
-    ensureTick()
   end
+  if sp.state and (sp.interval or 0) > 0 then
+    startInterval(sp)
+  else
+    stopInterval(sp)
+  end
+  ensureTick()
   applyOutput(sp)
   saveConfig()
   if sp.target == "none" then
@@ -1255,6 +1332,11 @@ local function toggleAll()
     if newState and not sp.ignoreTimer and (config.timerMode or 0) > 0 then
       timerEnds[sp] = os.clock() + config.timerMode
     end
+    if newState and (sp.interval or 0) > 0 then
+      startInterval(sp)
+    else
+      stopInterval(sp)
+    end
     applyOutput(sp)
   end
   ensureTick()
@@ -1287,6 +1369,8 @@ local function startSpawnerTimer(i, secs)
   if sp.ignoreTimer then
     -- this spawner never takes a timer; just make sure it is on
     sp.state = true
+    if (sp.interval or 0) > 0 then startInterval(sp) end
+    ensureTick()
     applyOutput(sp)
     saveConfig()
     ui.status = sp.name .. " ignores timers - turned on"
@@ -1294,14 +1378,16 @@ local function startSpawnerTimer(i, secs)
   end
   sp.state = true
   timerEnds[sp] = os.clock() + secs
+  if (sp.interval or 0) > 0 then startInterval(sp) end
   applyOutput(sp)
   saveConfig()
   ensureTick()
   ui.status = sp.name .. " on for " .. formatCountdown(secs)
 end
 
--- fires once a second while any countdown is running: turns off expired
--- spawners and refreshes the countdown display
+-- fires once a second while any countdown or interval pulse is running:
+-- turns off expired spawners, flips due pulse phases, refreshes the
+-- countdown display
 local function onTick()
   local now = os.clock()
   local expired = {}
@@ -1311,8 +1397,21 @@ local function onTick()
   for _, sp in ipairs(expired) do
     cancelSpawnerTimer(sp)
     sp.state = false
+    stopInterval(sp)
     applyOutput(sp)
     ui.status = sp.name .. " timer done - turned off"
+  end
+  for _, sp in ipairs(config.spawners) do
+    if sp.state and (sp.interval or 0) > 0 then
+      local nextAt = intervalNext[sp]
+      if not nextAt then
+        startInterval(sp)
+      elseif nextAt <= now then
+        intervalPhase[sp] = not (intervalPhase[sp] ~= false)
+        intervalNext[sp] = now + sp.interval
+        applyOutput(sp)
+      end
+    end
   end
   if #expired > 0 then saveConfig() end
   ensureTick()
@@ -1377,6 +1476,21 @@ local function activate(it)
       refreshItems()
       redraw()
     end
+  elseif k == "interval" then
+    if sp then openScreen("pick_interval") end
+  elseif k == "intervalopt" then
+    if sp then
+      sp.interval = (it.secs > 0) and it.secs or nil
+      if sp.state and (sp.interval or 0) > 0 then
+        startInterval(sp)
+        ensureTick()
+      else
+        stopInterval(sp)
+      end
+      applyOutput(sp)
+      saveConfig()
+      openScreen("edit")
+    end
   elseif k == "ignoretimer" then
     if sp then
       sp.ignoreTimer = not sp.ignoreTimer
@@ -1423,6 +1537,7 @@ local function activate(it)
         {
           { label = "Remove", fn = function()
               cancelSpawnerTimer(sp)
+              stopInterval(sp)
               forceLogicalOff(sp)
               for i, s in ipairs(config.spawners) do
                 if s == sp then
@@ -1514,6 +1629,7 @@ local function activate(it)
           { label = "Turn them off, unassign, and remove", fn = function()
               for _, s in ipairs(users) do
                 cancelSpawnerTimer(s)
+                stopInterval(s)
                 forceLogicalOff(s)
                 s.state = false
                 s.target = "none"
@@ -1776,6 +1892,10 @@ local function main()
       timerEnds[sp] = os.clock() + sp.timerLeft
     else
       sp.timerLeft = nil
+    end
+    -- interval spawners restart their pulse at the on phase after a boot
+    if sp.state and (sp.interval or 0) > 0 then
+      startInterval(sp)
     end
   end
   ensureTick()
