@@ -47,8 +47,11 @@
 --   the largest text scale that still fits the list.
 --
 -- per-spawner options (settings -> spawner): ignore timer (always stays
---   on, no countdowns ever attach), menu position top/bottom (bottom
---   rows anchor above the monitor's buttons), move up/down to reorder.
+--   on, no countdowns ever attach), bypass toggle all (the master
+--   switch skips it), menu position top/bottom (bottom rows anchor
+--   above the monitor's buttons), move up/down to reorder. reordering
+--   also works bios-style in the settings list itself: select a
+--   spawner and press + / - to move it.
 -- integrators can be given labels (settings -> manage integrators ->
 --   pick one -> set label). the header bar colour is also picked in
 --   settings. everything persists in the config file.
@@ -281,6 +284,8 @@ local function validSpawner(sp)
   if sp.ignoreTimer ~= nil and type(sp.ignoreTimer) ~= "boolean" then return false end
   -- optional field: where the row renders on the main screen
   if sp.pos ~= nil and sp.pos ~= "top" and sp.pos ~= "bottom" then return false end
+  -- optional field: the toggle-all master switch skips this spawner
+  if sp.bypassAll ~= nil and type(sp.bypassAll) ~= "boolean" then return false end
   if sp.target == "none" then return sp.side == "none" end
   return isValidSide(sp.target, sp.side)
 end
@@ -667,7 +672,7 @@ local function drawTermMain()
   if t.isColor() then t.setTextColor(colors.white) end
 end
 
-local function drawTermMenu(title)
+local function drawTermMenu(title, hint)
   local t = term
   local w, h = t.getSize()
   setColors(t, colors.white, colors.black)
@@ -716,7 +721,7 @@ local function drawTermMenu(title)
   end
   t.setCursorPos(2, h)
   if t.isColor() then t.setTextColor(colors.lightGray) end
-  t.write(truncate("Up/Dn move  Enter select  Backspace back", w - 2))
+  t.write(truncate(hint or "Up/Dn move  Enter select  Backspace back", w - 2))
   if t.isColor() then t.setTextColor(colors.white) end
 end
 
@@ -818,7 +823,11 @@ local function drawTerm()
     else
       title = s
     end
-    drawTermMenu(title)
+    local hint
+    if s == "settings" then
+      hint = "Enter select  +/- reorder  Backspace back"
+    end
+    drawTermMenu(title, hint)
   end
 end
 
@@ -1004,6 +1013,7 @@ local function buildEditItems()
     { kind = "side", label = "Side: " .. sp.side, dim = (sp.target == "none") },
     { kind = "inverted", label = "Inverted: " .. (sp.inverted and "yes" or "no") },
     { kind = "ignoretimer", label = "Ignore timer: " .. (sp.ignoreTimer and "yes" or "no") },
+    { kind = "bypassall", label = "Bypass Toggle All: " .. (sp.bypassAll and "yes" or "no") },
     { kind = "pos", label = "Menu position: " .. (sp.pos == "bottom" and "Bottom" or "Top") },
     { kind = "moveup", label = "[ Move up ]" },
     { kind = "movedown", label = "[ Move down ]" },
@@ -1217,18 +1227,29 @@ local function toggleSpawner(i)
 end
 
 -- master switch: if anything is on, turn everything off; otherwise turn
--- everything on. running countdowns are cancelled either way
+-- everything on. running countdowns are cancelled either way. spawners
+-- with bypassAll set are invisible to this switch in both directions
 local function toggleAll()
-  if #config.spawners == 0 then return end
-  local anyOn = false
+  local affected = {}
   for _, sp in ipairs(config.spawners) do
+    if not sp.bypassAll then affected[#affected + 1] = sp end
+  end
+  if #affected == 0 then
+    if #config.spawners > 0 then
+      ui.status = "every spawner bypasses Toggle All"
+      redraw()
+    end
+    return
+  end
+  local anyOn = false
+  for _, sp in ipairs(affected) do
     if sp.state then
       anyOn = true
       break
     end
   end
   local newState = not anyOn
-  for _, sp in ipairs(config.spawners) do
+  for _, sp in ipairs(affected) do
     cancelSpawnerTimer(sp)
     sp.state = newState
     if newState and not sp.ignoreTimer and (config.timerMode or 0) > 0 then
@@ -1318,6 +1339,7 @@ local function activate(it)
       inverted = false,
       state = false,
       ignoreTimer = false,
+      bypassAll = false,
       pos = "top",
     })
     saveConfig()
@@ -1360,6 +1382,13 @@ local function activate(it)
       sp.ignoreTimer = not sp.ignoreTimer
       -- an already-running countdown would defeat the point
       if sp.ignoreTimer then cancelSpawnerTimer(sp) end
+      saveConfig()
+      refreshItems()
+      redraw()
+    end
+  elseif k == "bypassall" then
+    if sp then
+      sp.bypassAll = not sp.bypassAll
       saveConfig()
       refreshItems()
       redraw()
@@ -1591,7 +1620,8 @@ local function handleMenuKey(code)
   elseif code == keys.space then
     -- convenience: space also flips yes/no style fields when selected
     local it = ui.items[ui.sel]
-    if it and (it.kind == "inverted" or it.kind == "ignoretimer" or it.kind == "pos") then
+    if it and (it.kind == "inverted" or it.kind == "ignoretimer"
+      or it.kind == "bypassall" or it.kind == "pos") then
       activate(it)
     end
   end
@@ -1636,6 +1666,28 @@ local function handleChar(ch)
       end
     elseif ch == "m" or ch == "M" then
       cycleTimerMode()
+    end
+  elseif ui.screen == "settings" then
+    -- bios-style reordering: +/- moves the selected spawner row; "=" and
+    -- "_" are accepted so shift state does not matter
+    local up = (ch == "+" or ch == "=")
+    local down = (ch == "-" or ch == "_")
+    if up or down then
+      local it = ui.items[ui.sel]
+      if it and it.kind == "spawner" then
+        local i = it.index
+        local j = up and i - 1 or i + 1
+        if config.spawners[j] then
+          config.spawners[i], config.spawners[j] = config.spawners[j], config.spawners[i]
+          saveConfig()
+          -- keep the selection on the spawner that moved
+          ui.sel = ui.sel + (j - i)
+          clampMenuScroll()
+          ui.status = "moved " .. config.spawners[j].name
+          refreshItems()
+          redraw()
+        end
+      end
     end
   end
 end

@@ -109,6 +109,11 @@ duration regardless of the default mode.
 When set, no timer ever attaches to it: it always stays on until switched
 off manually, regardless of the default mode or Toggle All.
 
+**Bypass Toggle All** — a second per-spawner option that makes the master
+switch skip it entirely, in both directions: Toggle All neither turns it
+on nor off. Useful for a spawner that should never be caught by the big
+red button.
+
 Either way the countdown shows on both displays and the spawner switches
 itself off at zero. A manual toggle cancels a running countdown.
 Countdowns survive reboots, resuming from the remaining time recorded at
@@ -122,7 +127,9 @@ Each spawner's settings screen also offers:
   anchored to the bottom of the monitor, just above the `[ Toggle All ]`
   button (when the list is too long to fit, it falls back to one scrolled
   list). On the terminal, Bottom spawners simply sort after the Top group.
-- **Move up / Move down** — reorder spawners within the list.
+- **Move up / Move down** — reorder spawners within the list. Reordering
+  also works BIOS-style directly in the settings list: select a spawner
+  row and press **+** / **-** to move it up or down.
 
 The header bar colour on both displays is selectable in settings
 (**Header colour**), with a picker that previews each colour.
