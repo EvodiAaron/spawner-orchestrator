@@ -49,6 +49,9 @@
 --   the default timer. settings are terminal-only. the monitor picks
 --   the largest text scale that still fits the list. utilities render
 --   dimmed and, to save vertical space, two per row where width allows.
+--   [ Toggle All ] and [ Timer: ... ] share one bottom row on wide
+--   monitors and stack on narrow ones. a dedicated utilities monitor
+--   renders a touch smaller than the spawner monitor.
 --
 -- per-item options (settings -> item): item type spawner/utility
 --   (utilities are grouped below the spawners and anchor above the
@@ -79,6 +82,13 @@ local MAX_INPUT_LEN = 32
 -- below this monitor width (in characters at the current scale) utilities
 -- fall back to a single column; above it they render two per row
 local MIN_TWOCOL_W = 20
+-- at or above this width the primary monitor's Toggle All and Timer
+-- buttons share one bottom row (freeing a list row); below it they stack.
+-- 30 is the widest the two labels ever need side by side
+local CTRL_ONE_ROW_MIN_W = 30
+-- the utilities monitor renders one half-step smaller than its best fit
+-- so utilities read as the secondary panel
+local UTIL_SCALE_BIAS = 0.5
 
 -- timer presets offered when turning a spawner on for a set duration
 local TIMER_PRESETS = {
@@ -180,9 +190,10 @@ local intervalNext = {}
 -- each descriptor rebuilds its hit maps on every draw:
 --   rowMap  monitor y -> config.spawners index for full-width rows
 --   cells   two-column utility hitboxes: { { y, x1, x2, index }, ... }
+--   toggleAllBtn / timerBtn  control-button hitboxes { y, x1, x2 }
 local monPrimary = {
   dev = nil, name = nil, color = false, scale = 1,
-  rowMap = {}, cells = {}, toggleAllY = nil, timerY = nil,
+  rowMap = {}, cells = {}, toggleAllBtn = nil, timerBtn = nil,
 }
 local monUtil = {
   dev = nil, name = nil, color = false, scale = 1,
@@ -532,7 +543,7 @@ end
 -- needs, so a two-column utility block can claim fewer rows at wider
 -- scales. converges because the scale-1 grid is fixed by the physical
 -- monitor size
-local function fitScale(m, minCols, rowsFor)
+local function fitScale(m, minCols, rowsFor, biasDown)
   if not m.dev then return end
   local ok, w, h = pcall(m.dev.getSize)
   if not ok or type(w) ~= "number" then return end
@@ -544,6 +555,11 @@ local function fitScale(m, minCols, rowsFor)
     local rows = math.floor(h1 / s)
     if cols >= minCols and rows >= rowsFor(cols) then break end
     s = s - 0.5
+  end
+  -- an optional downward nudge shrinks text below the best fit (always
+  -- safe: smaller text only frees space). never below the 0.5 minimum
+  if biasDown and biasDown > 0 then
+    s = math.max(0.5, s - biasDown)
   end
   if s ~= m.scale then
     m.scale = s
@@ -1084,36 +1100,63 @@ local function drawScrollArrows(m, w, listH, scroll, n)
   end
 end
 
+-- how many bottom rows the primary controls occupy at a given width: one
+-- combined row when there is room for both labels, otherwise two stacked
+local function primaryCtrlRows(w)
+  return (w >= CTRL_ONE_ROW_MIN_W) and 1 or 2
+end
+
 -- the master switch and default-timer selector along the bottom of a
--- touch monitor; settings themselves live on the terminal
+-- touch monitor; settings themselves live on the terminal. wide monitors
+-- put both on the last row, narrow ones stack them. each button records a
+-- hitbox so a tap on a shared row still lands on the right control
 local function drawControlRows(m, w, h)
   local d = m.dev
-  local label = "[ Toggle All ]"
-  d.setTextColor(colors.yellow)
-  d.setCursorPos(math.max(1, math.floor((w - #label) / 2) + 1), h - 1)
-  d.write(truncate(label, w))
-  m.toggleAllY = h - 1
-  label = "[ Timer: " .. timerModeLabel() .. " ]"
-  d.setTextColor(colors.cyan)
-  d.setCursorPos(math.max(1, math.floor((w - #label) / 2) + 1), h)
-  d.write(truncate(label, w))
-  d.setTextColor(colors.white)
-  m.timerY = h
+  local tgl = "[ Toggle All ]"
+  local tmr = "[ Timer: " .. timerModeLabel() .. " ]"
+  if primaryCtrlRows(w) == 1 then
+    local gap = 2
+    local total = #tgl + gap + #tmr
+    local x0 = math.max(1, math.floor((w - total) / 2) + 1)
+    d.setTextColor(colors.yellow)
+    d.setCursorPos(x0, h)
+    d.write(tgl)
+    d.setTextColor(colors.cyan)
+    d.setCursorPos(x0 + #tgl + gap, h)
+    d.write(tmr)
+    d.setTextColor(colors.white)
+    m.toggleAllBtn = { y = h, x1 = x0, x2 = x0 + #tgl - 1 }
+    m.timerBtn = { y = h, x1 = x0 + #tgl + gap, x2 = x0 + #tgl + gap + #tmr - 1 }
+  else
+    d.setTextColor(colors.yellow)
+    d.setCursorPos(math.max(1, math.floor((w - #tgl) / 2) + 1), h - 1)
+    d.write(truncate(tgl, w))
+    d.setTextColor(colors.cyan)
+    d.setCursorPos(math.max(1, math.floor((w - #tmr) / 2) + 1), h)
+    d.write(truncate(tmr, w))
+    d.setTextColor(colors.white)
+    -- a stacked button owns its whole row
+    m.toggleAllBtn = { y = h - 1, x1 = 1, x2 = w }
+    m.timerBtn = { y = h, x1 = 1, x2 = w }
+  end
 end
 
 local function drawPrimaryRaw()
   local m = monPrimary
   local d = m.dev
   m.rowMap, m.cells = {}, {}
-  m.toggleAllY, m.timerY = nil, nil
+  m.toggleAllBtn, m.timerBtn = nil, nil
   local nSp, nUtil = countItems()
   local hasUtilMon = monUtil.dev ~= nil
-  -- fit the scale to what this monitor will hold; a dedicated utility
-  -- monitor means the utilities do not count here
+  -- fit the scale to exactly what this monitor will hold - heading, the
+  -- list itself, and the control rows - with no wasted row, so a dense
+  -- list (e.g. ~16 spawners) renders at the largest text that still fits.
+  -- a dedicated utility monitor means the utilities do not count here
   fitScale(m, 15, function(cols)
     local ncol = (cols >= MIN_TWOCOL_W) and 2 or 1
     local uHere = hasUtilMon and 0 or nUtil
-    return math.max(5, nSp + math.ceil(uHere / ncol) + (m.color and 4 or 2))
+    local overhead = 1 + (m.color and primaryCtrlRows(cols) or 0) -- heading + controls
+    return math.max(5, nSp + math.ceil(uHere / ncol) + overhead)
   end)
   local ok, w, h = pcall(d.getSize)
   if not ok or type(w) ~= "number" then return end
@@ -1132,8 +1175,10 @@ local function drawPrimaryRaw()
     return
   end
   drawMonHeading(m, w, m.color and "SPAWNERS" or "= SPAWNERS =")
-  -- basic monitors have no touch, so no control rows: the list gets the space
-  local listH = m.color and math.max(1, h - 3) or math.max(1, h - 1)
+  -- list area = everything but the heading and (on touch monitors) the
+  -- one or two control rows; basic monitors have no controls
+  local ctrlRows = m.color and primaryCtrlRows(w) or 0
+  local listH = math.max(1, h - 1 - ctrlRows)
   local spIdx, utilIdx = {}, {}
   for i, sp in ipairs(config.spawners) do
     if isUtility(sp) then utilIdx[#utilIdx + 1] = i else spIdx[#spIdx + 1] = i end
@@ -1196,7 +1241,7 @@ local function drawUtilMonRaw()
   fitScale(m, 8, function(cols)
     local ncol = (cols >= MIN_TWOCOL_W) and 2 or 1
     return math.max(3, math.ceil(nUtil / ncol) + 1)
-  end)
+  end, UTIL_SCALE_BIAS)
   local ok, w, h = pcall(d.getSize)
   if not ok or type(w) ~= "number" then return end
   if m.color then
@@ -2046,6 +2091,10 @@ local function monHitIndex(m, x, y)
   return nil
 end
 
+local function hitButton(btn, x, y)
+  return btn and y == btn.y and x >= btn.x1 and x <= btn.x2
+end
+
 local function handleTouch(name, x, y)
   if ui.screen ~= "main" then
     -- monitors show a notice while settings are open; ignore taps
@@ -2072,12 +2121,13 @@ local function handleTouch(name, x, y)
     toggleSpawner(i)
     return
   end
-  -- control rows only exist on the primary monitor
-  if m.toggleAllY and y == m.toggleAllY then
+  -- control buttons only exist on the primary monitor; they may share a
+  -- row, so match by hitbox rather than row alone
+  if hitButton(m.toggleAllBtn, x, y) then
     toggleAll()
     return
   end
-  if m.timerY and y == m.timerY then
+  if hitButton(m.timerBtn, x, y) then
     cycleTimerMode()
   end
 end
