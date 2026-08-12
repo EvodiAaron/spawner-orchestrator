@@ -51,7 +51,7 @@
 --   dimmed and, to save vertical space, two per row where width allows.
 --   [ Toggle All ] and [ Timer: ... ] share one bottom row on wide
 --   monitors and stack on narrow ones. a dedicated utilities monitor
---   renders a touch smaller than the spawner monitor.
+--   renders no larger than the spawner monitor.
 --
 -- per-item options (settings -> item): item type spawner/utility
 --   (utilities are grouped below the spawners and anchor above the
@@ -86,9 +86,6 @@ local MIN_TWOCOL_W = 20
 -- buttons share one bottom row (freeing a list row); below it they stack.
 -- 30 is the widest the two labels ever need side by side
 local CTRL_ONE_ROW_MIN_W = 30
--- the utilities monitor renders one half-step smaller than its best fit
--- so utilities read as the secondary panel
-local UTIL_SCALE_BIAS = 0.5
 
 -- timer presets offered when turning a spawner on for a set duration
 local TIMER_PRESETS = {
@@ -543,7 +540,7 @@ end
 -- needs, so a two-column utility block can claim fewer rows at wider
 -- scales. converges because the scale-1 grid is fixed by the physical
 -- monitor size
-local function fitScale(m, minCols, rowsFor, biasDown)
+local function fitScale(m, minCols, rowsFor, capScale)
   if not m.dev then return end
   local ok, w, h = pcall(m.dev.getSize)
   if not ok or type(w) ~= "number" then return end
@@ -556,10 +553,10 @@ local function fitScale(m, minCols, rowsFor, biasDown)
     if cols >= minCols and rows >= rowsFor(cols) then break end
     s = s - 0.5
   end
-  -- an optional downward nudge shrinks text below the best fit (always
+  -- an optional cap keeps this monitor no larger than another (always
   -- safe: smaller text only frees space). never below the 0.5 minimum
-  if biasDown and biasDown > 0 then
-    s = math.max(0.5, s - biasDown)
+  if capScale and s > capScale then
+    s = math.max(0.5, capScale)
   end
   if s ~= m.scale then
     m.scale = s
@@ -1238,10 +1235,12 @@ local function drawUtilMonRaw()
   local d = m.dev
   m.rowMap, m.cells = {}, {}
   local _, nUtil = countItems()
+  -- keep utilities no larger than the spawner monitor (drawn first, so
+  -- its scale is current); dimming already marks them as secondary
   fitScale(m, 8, function(cols)
     local ncol = (cols >= MIN_TWOCOL_W) and 2 or 1
     return math.max(3, math.ceil(nUtil / ncol) + 1)
-  end, UTIL_SCALE_BIAS)
+  end, monPrimary.scale)
   local ok, w, h = pcall(d.getSize)
   if not ok or type(w) ~= "number" then return end
   if m.color then
