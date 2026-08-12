@@ -16,8 +16,11 @@
 --   * required: one advanced computer (colour + arrow keys)
 --   * optional: an advanced monitor for a touch panel. place it
 --     touching the computer or connect it over wired modems. a basic
---     monitor also works but is display-only (no touch). only the
---     first attached monitor is used.
+--     monitor also works but is display-only (no touch).
+--   * optional: a second monitor. when one is present the utilities
+--     move onto it and the first monitor shows only the spawners. the
+--     two lowest-named monitors are used (first = spawners, second =
+--     utilities)
 --   * optional: plethora redstone integrators for spawners that are
 --     not adjacent to the computer itself
 --
@@ -44,16 +47,18 @@
 -- controls (advanced monitor): tap a row to toggle it, tap
 --   [ Toggle All ] for the master switch, tap [ Timer: ... ] to cycle
 --   the default timer. settings are terminal-only. the monitor picks
---   the largest text scale that still fits the list.
+--   the largest text scale that still fits the list. utilities render
+--   dimmed and, to save vertical space, two per row where width allows.
 --
--- per-spawner options (settings -> spawner): interval mode (while on,
---   the output pulses n seconds on / n seconds off; the row still reads
---   ON but shades faintly during the off half), ignore timer (always
---   stays on, no countdowns ever attach), bypass toggle all (the master
---   switch skips it), menu position top/bottom (bottom rows anchor
---   above the monitor's buttons), move up/down to reorder. reordering
---   also works bios-style in the settings list itself: select a
---   spawner and press + / - to move it.
+-- per-item options (settings -> item): item type spawner/utility
+--   (utilities are grouped below the spawners and anchor above the
+--   monitor's buttons, and render slightly dimmed), interval mode (while
+--   on, the output pulses n seconds on / n seconds off; the row still
+--   reads ON but shades faintly during the off half), ignore timer
+--   (always stays on, no countdowns ever attach), bypass toggle all (the
+--   master switch skips it), move up/down to reorder. reordering also
+--   works bios-style in the settings list itself: select an item and
+--   press + / - to move it.
 -- integrators can be given labels (settings -> manage integrators ->
 --   pick one -> set label). the header bar colour is also picked in
 --   settings. everything persists in the config file.
@@ -71,6 +76,9 @@ local CONFIG_TMP = "config.tmp"
 local CONFIG_BAK = "config.bak"
 local MAX_NAME_LEN = 24
 local MAX_INPUT_LEN = 32
+-- below this monitor width (in characters at the current scale) utilities
+-- fall back to a single column; above it they render two per row
+local MIN_TWOCOL_W = 20
 
 -- timer presets offered when turning a spawner on for a set duration
 local TIMER_PRESETS = {
@@ -165,13 +173,21 @@ local tickTimerId = nil
 local intervalPhase = {}
 local intervalNext = {}
 
--- monitor state
-local mon, monName
-local monColor = false
-local monScale = 1
-local monRowMap = {} -- monitor y -> spawner index, rebuilt on every draw
-local monToggleAllY = nil
-local monTimerY = nil
+-- monitor state. two monitors are driven: monPrimary shows the spawner
+-- list plus the touch control rows, and (when it is the only monitor)
+-- the utilities as well. monUtil, present only when a second monitor is
+-- attached, shows the utilities instead so they never crowd the spawners.
+-- each descriptor rebuilds its hit maps on every draw:
+--   rowMap  monitor y -> config.spawners index for full-width rows
+--   cells   two-column utility hitboxes: { { y, x1, x2, index }, ... }
+local monPrimary = {
+  dev = nil, name = nil, color = false, scale = 1,
+  rowMap = {}, cells = {}, toggleAllY = nil, timerY = nil,
+}
+local monUtil = {
+  dev = nil, name = nil, color = false, scale = 1,
+  rowMap = {}, cells = {},
+}
 
 local ui = {
   screen = "main", -- main|settings|edit|pick_target|pick_side|integrators|scan|confirm|input
@@ -266,15 +282,21 @@ local function integLabel(name)
   return name
 end
 
--- main-screen display order: "top" spawners in config order, then the
--- "bottom" group (rendered anchored to the bottom on the monitor)
+-- an item's type decides where it renders: spawners on top, utilities
+-- grouped below (and anchored to the bottom on the monitor)
+local function isUtility(sp)
+  return sp.itemType == "utility"
+end
+
+-- main-screen display order: spawners in config order, then the utility
+-- group (rendered anchored to the bottom on the monitor)
 local function displayOrder()
   local order = {}
   for i, sp in ipairs(config.spawners) do
-    if sp.pos ~= "bottom" then order[#order + 1] = i end
+    if not isUtility(sp) then order[#order + 1] = i end
   end
   for i, sp in ipairs(config.spawners) do
-    if sp.pos == "bottom" then order[#order + 1] = i end
+    if isUtility(sp) then order[#order + 1] = i end
   end
   return order
 end
@@ -314,8 +336,11 @@ local function validSpawner(sp)
   if sp.timerLeft ~= nil and type(sp.timerLeft) ~= "number" then return false end
   -- optional field: never attach timers to this spawner
   if sp.ignoreTimer ~= nil and type(sp.ignoreTimer) ~= "boolean" then return false end
-  -- optional field: where the row renders on the main screen
+  -- optional legacy field: superseded by itemType, still accepted so old
+  -- configs load and can be migrated
   if sp.pos ~= nil and sp.pos ~= "top" and sp.pos ~= "bottom" then return false end
+  -- optional field: "spawner" or "utility"; utilities group at the bottom
+  if sp.itemType ~= nil and sp.itemType ~= "spawner" and sp.itemType ~= "utility" then return false end
   -- optional field: the toggle-all master switch skips this spawner
   if sp.bypassAll ~= nil and type(sp.bypassAll) ~= "boolean" then return false end
   -- optional field: pulse length in seconds; nil/0 = plain on state
@@ -395,6 +420,13 @@ local function loadConfig()
     -- older configs predate these optional fields
     if type(config.timerMode) ~= "number" then config.timerMode = 0 end
     if type(config.integratorLabels) ~= "table" then config.integratorLabels = {} end
+    -- itemType supersedes the old top/bottom pos field: a bottom-anchored
+    -- row becomes a utility, everything else a spawner
+    for _, sp in ipairs(config.spawners) do
+      if sp.itemType ~= "spawner" and sp.itemType ~= "utility" then
+        sp.itemType = (sp.pos == "bottom") and "utility" or "spawner"
+      end
+    end
   else
     -- unreadable or wrong shape: keep it for inspection, start fresh
     if fs.exists(CONFIG_BAK) then fs.delete(CONFIG_BAK) end
@@ -483,56 +515,81 @@ local function scanForIntegrators()
   return found
 end
 
--- pick the largest text scale where the layout still fits: at least 15
--- columns for name + status, and enough rows for the list. converges
--- because the character grid at scale 1 is a fixed property of the
--- monitor's physical size
-local function updateMonitorScale()
-  if not mon then return end
-  local ok, w, h = pcall(mon.getSize)
+-- count configured items split by type
+local function countItems()
+  local nSp, nUtil = 0, 0
+  if config then
+    for _, sp in ipairs(config.spawners) do
+      if isUtility(sp) then nUtil = nUtil + 1 else nSp = nSp + 1 end
+    end
+  end
+  return nSp, nUtil
+end
+
+-- pick the largest text scale where the layout still fits: at least
+-- minCols columns for name + status, and enough rows. rowsFor(cols) maps
+-- the columns available at a candidate scale to the rows the layout then
+-- needs, so a two-column utility block can claim fewer rows at wider
+-- scales. converges because the scale-1 grid is fixed by the physical
+-- monitor size
+local function fitScale(m, minCols, rowsFor)
+  if not m.dev then return end
+  local ok, w, h = pcall(m.dev.getSize)
   if not ok or type(w) ~= "number" then return end
-  local w1 = w * monScale -- character grid the monitor would have at scale 1
-  local h1 = h * monScale
-  local n = config and #config.spawners or 0
-  -- touch monitors carry two control rows at the bottom, basic ones none
-  local rowsNeeded = math.max(5, n + (monColor and 4 or 2))
+  local w1 = w * m.scale -- character grid the monitor would have at scale 1
+  local h1 = h * m.scale
   local s = 5
   while s > 0.5 do
-    if math.floor(w1 / s) >= 15 and math.floor(h1 / s) >= rowsNeeded then
-      break
-    end
+    local cols = math.floor(w1 / s)
+    local rows = math.floor(h1 / s)
+    if cols >= minCols and rows >= rowsFor(cols) then break end
     s = s - 0.5
   end
-  if s ~= monScale then
-    monScale = s
-    pcall(mon.setTextScale, s)
+  if s ~= m.scale then
+    m.scale = s
+    pcall(m.dev.setTextScale, s)
   end
 end
 
-local function findMonitor()
-  local newMon, newName
-  -- the filter callback only captures the peripheral's name, which is
-  -- what monitor_touch events report; returning false keeps find cheap
-  peripheral.find("monitor", function(name, m)
-    if not newMon then
-      newMon = m
-      newName = name
-    end
-    return false
-  end)
-  if newName == monName then
-    mon = newMon -- refresh the handle, keep the scale we already set
+-- point descriptor m at (dev, name); a re-attach of the same monitor
+-- keeps the scale we already picked, a new one resets to scale 1 and lets
+-- the next draw re-fit
+local function attachMonitor(m, dev, name)
+  if m.name == name and m.dev then
+    m.dev = dev
     return
   end
-  mon, monName = newMon, newName
-  monColor = false
-  if mon then
-    local ok, c = pcall(mon.isColor)
-    monColor = (ok and c) or false -- advanced monitors are the colour ones
-    monScale = 1
-    pcall(mon.setTextScale, 1)
-    updateMonitorScale()
+  m.dev, m.name = dev, name
+  m.color = false
+  if dev then
+    local ok, c = pcall(dev.isColor)
+    m.color = (ok and c) or false -- advanced monitors are the colour ones
+    m.scale = 1
+    pcall(dev.setTextScale, 1)
   end
+end
+
+local function detachMonitor(m)
+  m.dev, m.name = nil, nil
+  m.color = false
+  m.scale = 1
+end
+
+-- assign attached monitors to roles. the two lowest-named monitors win:
+-- the first is the primary (spawners + controls), the second, if any,
+-- becomes the dedicated utilities monitor. sorting by name keeps a given
+-- physical monitor in the same role across rescans
+local function findMonitors()
+  local list = {}
+  peripheral.find("monitor", function(name, dev)
+    list[#list + 1] = { name = name, dev = dev }
+    return false
+  end)
+  table.sort(list, function(a, b) return a.name < b.name end)
+  if list[1] then attachMonitor(monPrimary, list[1].dev, list[1].name)
+  else detachMonitor(monPrimary) end
+  if list[2] then attachMonitor(monUtil, list[2].dev, list[2].name)
+  else detachMonitor(monUtil) end
 end
 
 local function removeIntegratorByName(name)
@@ -661,7 +718,12 @@ local function drawTermMain()
       t.write(selected and ">" or " ")
       local endT = timerEnds[sp]
       t.setCursorPos(3, y)
+      -- utilities read as secondary rows: dimmed unless highlighted
+      if isUtility(sp) and not selected and t.isColor() then
+        t.setTextColor(colors.lightGray)
+      end
       t.write(truncate(sp.name, endT and (w - 21) or (w - 13)))
+      if t.isColor() then t.setTextColor(colors.white) end
       if endT then
         local cd = formatCountdown(endT - os.clock())
         if t.isColor() then t.setTextColor(colors.cyan) end
@@ -880,144 +942,307 @@ local function drawTerm()
   end
 end
 
-local function drawMonitorRaw()
-  updateMonitorScale()
-  local w, h = mon.getSize()
-  monRowMap = {}
-  monToggleAllY = nil
-  monTimerY = nil
-  if monColor then
-    mon.setTextColor(colors.white)
-    mon.setBackgroundColor(colors.black)
+-- column layout for the two-column utility block: one column on narrow
+-- monitors, two side by side once there is room. content ends at w-1 so
+-- the last column stays free for scroll arrows
+local function utilColumns(w)
+  if w < MIN_TWOCOL_W then
+    return { { x = 2, w = math.max(1, w - 2) } }
   end
-  mon.clear()
+  local col2x = math.floor(w / 2) + 1
+  return {
+    { x = 2, w = math.max(1, col2x - 3) },     -- ends at col2x-2, 1-col gap
+    { x = col2x, w = math.max(1, w - col2x) },  -- ends at w-1
+  }
+end
+
+-- a utility drawn inside one column cell: dimmed name, offline marker,
+-- right-aligned status bracket. records the cell as a touch hitbox
+local function drawUtilCell(m, sp, i, x, y, cellW)
+  local d, color = m.dev, m.color
+  local xEnd = x + cellW - 1
+  m.cells[#m.cells + 1] = { y = y, x1 = x, x2 = xEnd, index = i }
+  local text, col = spawnerStatusText(sp)
+  local bracketW = #text + 2
+  local offline = spawnerOffline(sp)
+  local nameW = cellW - bracketW - (offline and 2 or 0)
+  if nameW < 1 then nameW = 1 end
+  d.setCursorPos(x, y)
+  if color then d.setTextColor(colors.lightGray) end -- utilities read dimmed
+  d.write(truncate(sp.name, nameW))
+  if color then d.setTextColor(colors.white) end
+  if offline then
+    if color then d.setTextColor(colors.yellow) end
+    d.setCursorPos(xEnd - bracketW, y)
+    d.write("!")
+    if color then d.setTextColor(colors.white) end
+  end
+  d.setCursorPos(xEnd - bracketW + 1, y)
+  d.write("[")
+  if color then d.setTextColor(col) end
+  d.write(text)
+  if color then d.setTextColor(colors.white) end
+  d.write("]")
+end
+
+-- lay out the utility list across columns within rows [yTop, yTop+rows-1],
+-- filling row-major. anchorBottom pins the block to the last rows
+local function drawUtilList(m, utilIdx, yTop, rows, w, anchorBottom)
+  local cols = utilColumns(w)
+  local ncol = #cols
+  local need = math.ceil(#utilIdx / ncol)
+  if need > rows then need = rows end
+  local startY = anchorBottom and (yTop + rows - need) or yTop
+  if startY < yTop then startY = yTop end
+  local k = 1
+  for r = 0, need - 1 do
+    local y = startY + r
+    for c = 1, ncol do
+      local idx = utilIdx[k]
+      if idx and config.spawners[idx] then
+        drawUtilCell(m, config.spawners[idx], idx, cols[c].x, y, cols[c].w)
+      end
+      k = k + 1
+    end
+  end
+end
+
+-- a full-width row: name, optional countdown, offline marker, status
+local function drawSpawnerRow(m, sp, i, y, w)
+  local d, color = m.dev, m.color
+  m.rowMap[y] = i
+  local endT = timerEnds[sp]
+  local showTimer = endT and w >= 22
+  d.setCursorPos(2, y)
+  -- utilities render dimmed so they read as a secondary group
+  if isUtility(sp) and color then d.setTextColor(colors.lightGray) end
+  d.write(truncate(sp.name, showTimer and (w - 17) or (w - 9)))
+  if color then d.setTextColor(colors.white) end
+  if showTimer then
+    local cd = formatCountdown(endT - os.clock())
+    if color then d.setTextColor(colors.cyan) end
+    d.setCursorPos(w - 8 - #cd, y)
+    d.write(cd)
+    if color then d.setTextColor(colors.white) end
+  end
+  if spawnerOffline(sp) then
+    if color then d.setTextColor(colors.yellow) end
+    d.setCursorPos(w - 7, y)
+    d.write("!")
+    if color then d.setTextColor(colors.white) end
+  end
+  local text, col = spawnerStatusText(sp)
+  -- right-align the bracket group so "]" always sits at w-1
+  d.setCursorPos(w - 2 - #text, y)
+  d.write("[")
+  if color then d.setTextColor(col) end
+  d.write(text)
+  if color then d.setTextColor(colors.white) end
+  d.write("]")
+end
+
+-- centred full-width heading bar
+local function drawMonHeading(m, w, title)
+  local d = m.dev
+  if m.color then
+    local bg, fg = headerStyle()
+    d.setBackgroundColor(bg)
+    d.setTextColor(fg)
+  end
+  d.setCursorPos(1, 1)
+  d.clearLine()
+  d.setCursorPos(math.max(1, math.floor((w - #title) / 2) + 1), 1)
+  d.write(truncate(title, w))
+  if m.color then
+    d.setBackgroundColor(colors.black)
+    d.setTextColor(colors.white)
+  end
+end
+
+-- the "settings open" notice shown on a monitor while the terminal is busy
+local function drawNoticeOn(d, w, h)
+  local msg1 = "Configuration in"
+  local msg2 = "progress on terminal"
+  local midY = math.max(1, math.floor(h / 2))
+  d.setCursorPos(math.max(1, math.floor((w - #msg1) / 2) + 1), midY)
+  d.write(truncate(msg1, w))
+  if midY + 1 <= h then
+    d.setCursorPos(math.max(1, math.floor((w - #msg2) / 2) + 1), midY + 1)
+    d.write(truncate(msg2, w))
+  end
+end
+
+local function drawScrollArrows(m, w, listH, scroll, n)
+  local d = m.dev
+  if scroll > 0 then
+    d.setCursorPos(w, 2)
+    d.write("^")
+  end
+  if scroll + listH < n then
+    d.setCursorPos(w, 1 + listH)
+    d.write("v")
+  end
+end
+
+-- the master switch and default-timer selector along the bottom of a
+-- touch monitor; settings themselves live on the terminal
+local function drawControlRows(m, w, h)
+  local d = m.dev
+  local label = "[ Toggle All ]"
+  d.setTextColor(colors.yellow)
+  d.setCursorPos(math.max(1, math.floor((w - #label) / 2) + 1), h - 1)
+  d.write(truncate(label, w))
+  m.toggleAllY = h - 1
+  label = "[ Timer: " .. timerModeLabel() .. " ]"
+  d.setTextColor(colors.cyan)
+  d.setCursorPos(math.max(1, math.floor((w - #label) / 2) + 1), h)
+  d.write(truncate(label, w))
+  d.setTextColor(colors.white)
+  m.timerY = h
+end
+
+local function drawPrimaryRaw()
+  local m = monPrimary
+  local d = m.dev
+  m.rowMap, m.cells = {}, {}
+  m.toggleAllY, m.timerY = nil, nil
+  local nSp, nUtil = countItems()
+  local hasUtilMon = monUtil.dev ~= nil
+  -- fit the scale to what this monitor will hold; a dedicated utility
+  -- monitor means the utilities do not count here
+  fitScale(m, 15, function(cols)
+    local ncol = (cols >= MIN_TWOCOL_W) and 2 or 1
+    local uHere = hasUtilMon and 0 or nUtil
+    return math.max(5, nSp + math.ceil(uHere / ncol) + (m.color and 4 or 2))
+  end)
+  local ok, w, h = pcall(d.getSize)
+  if not ok or type(w) ~= "number" then return end
+  if m.color then
+    d.setTextColor(colors.white)
+    d.setBackgroundColor(colors.black)
+  end
+  d.clear()
   if w < 8 or h < 3 then
-    mon.setCursorPos(1, 1)
-    mon.write(truncate("panel", w))
+    d.setCursorPos(1, 1)
+    d.write(truncate("panel", w))
     return
   end
   if ui.screen ~= "main" then
-    -- never show a stale list while settings are open
-    local msg1 = "Configuration in"
-    local msg2 = "progress on terminal"
-    local midY = math.max(1, math.floor(h / 2))
-    mon.setCursorPos(math.max(1, math.floor((w - #msg1) / 2) + 1), midY)
-    mon.write(truncate(msg1, w))
-    if midY + 1 <= h then
-      mon.setCursorPos(math.max(1, math.floor((w - #msg2) / 2) + 1), midY + 1)
-      mon.write(truncate(msg2, w))
-    end
+    drawNoticeOn(d, w, h)
     return
   end
-  -- heading: a full-width bar so it stands out from the list rows
-  local title = monColor and "SPAWNERS" or "= SPAWNERS ="
-  if monColor then
-    local bg, fg = headerStyle()
-    mon.setBackgroundColor(bg)
-    mon.setTextColor(fg)
-  end
-  mon.setCursorPos(1, 1)
-  mon.clearLine()
-  mon.setCursorPos(math.max(1, math.floor((w - #title) / 2) + 1), 1)
-  mon.write(truncate(title, w))
-  if monColor then
-    mon.setBackgroundColor(colors.black)
-    mon.setTextColor(colors.white)
-  end
+  drawMonHeading(m, w, m.color and "SPAWNERS" or "= SPAWNERS =")
   -- basic monitors have no touch, so no control rows: the list gets the space
-  local listH = monColor and math.max(1, h - 3) or math.max(1, h - 1)
-  local n = #config.spawners
-  if n == 0 then
-    mon.setCursorPos(2, 2)
-    mon.write(truncate("(none configured)", w - 1))
-  else
-    local function drawMonRow(sp, i, y)
-      monRowMap[y] = i
-      local endT = timerEnds[sp]
-      local showTimer = endT and w >= 22
-      mon.setCursorPos(2, y)
-      mon.write(truncate(sp.name, showTimer and (w - 17) or (w - 9)))
-      if showTimer then
-        local cd = formatCountdown(endT - os.clock())
-        if monColor then mon.setTextColor(colors.cyan) end
-        mon.setCursorPos(w - 8 - #cd, y)
-        mon.write(cd)
-        if monColor then mon.setTextColor(colors.white) end
-      end
-      if spawnerOffline(sp) then
-        if monColor then mon.setTextColor(colors.yellow) end
-        mon.setCursorPos(w - 7, y)
-        mon.write("!")
-        if monColor then mon.setTextColor(colors.white) end
-      end
-      local text, col = spawnerStatusText(sp)
-      -- right-align the bracket group so "]" always sits at w-1
-      mon.setCursorPos(w - 2 - #text, y)
-      mon.write("[")
-      if monColor then mon.setTextColor(col) end
-      mon.write(text)
-      if monColor then mon.setTextColor(colors.white) end
-      mon.write("]")
-    end
-    local order = displayOrder()
-    if n <= listH then
-      -- everything fits: "top" rows flow from the heading, "bottom"
-      -- rows anchor just above the control buttons
+  local listH = m.color and math.max(1, h - 3) or math.max(1, h - 1)
+  local spIdx, utilIdx = {}, {}
+  for i, sp in ipairs(config.spawners) do
+    if isUtility(sp) then utilIdx[#utilIdx + 1] = i else spIdx[#spIdx + 1] = i end
+  end
+  if #config.spawners == 0 then
+    d.setCursorPos(2, 2)
+    d.write(truncate("(none configured)", w - 1))
+  elseif hasUtilMon then
+    -- utilities have their own monitor; show only spawners here
+    if #spIdx == 0 then
+      d.setCursorPos(2, 2)
+      d.write(truncate("(utilities on 2nd monitor)", w - 1))
+    elseif #spIdx <= listH then
       local y = 2
-      for _, i in ipairs(order) do
-        local sp = config.spawners[i]
-        if sp.pos ~= "bottom" then
-          drawMonRow(sp, i, y)
-          y = y + 1
-        end
-      end
-      local bottoms = {}
-      for _, i in ipairs(order) do
-        if config.spawners[i].pos == "bottom" then bottoms[#bottoms + 1] = i end
-      end
-      y = (1 + listH) - #bottoms + 1
-      for _, i in ipairs(bottoms) do
-        drawMonRow(config.spawners[i], i, y)
+      for _, i in ipairs(spIdx) do
+        drawSpawnerRow(m, config.spawners[i], i, y, w)
         y = y + 1
       end
     else
-      -- too many rows to fit: contiguous scrolled list, anchoring off
+      for row = 1, listH do
+        local p = ui.mainScroll + row
+        if p > #spIdx then break end
+        drawSpawnerRow(m, config.spawners[spIdx[p]], spIdx[p], 1 + row, w)
+      end
+      drawScrollArrows(m, w, listH, ui.mainScroll, #spIdx)
+    end
+  else
+    -- single monitor: spawners on top, utilities two-column at the bottom
+    local ncol = #utilColumns(w)
+    local uRows = math.ceil(#utilIdx / ncol)
+    if #spIdx + uRows <= listH then
+      local y = 2
+      for _, i in ipairs(spIdx) do
+        drawSpawnerRow(m, config.spawners[i], i, y, w)
+        y = y + 1
+      end
+      if #utilIdx > 0 then
+        drawUtilList(m, utilIdx, 2, listH, w, true)
+      end
+    else
+      -- too much to fit: contiguous scrolled list, two-column off
+      local order = displayOrder()
+      local n = #order
       for row = 1, listH do
         local p = ui.mainScroll + row
         if p > n then break end
-        drawMonRow(config.spawners[order[p]], order[p], 1 + row)
+        drawSpawnerRow(m, config.spawners[order[p]], order[p], 1 + row, w)
       end
-      if ui.mainScroll > 0 then
-        mon.setCursorPos(w, 2)
-        mon.write("^")
-      end
-      if ui.mainScroll + listH < n then
-        mon.setCursorPos(w, 1 + listH)
-        mon.write("v")
-      end
+      drawScrollArrows(m, w, listH, ui.mainScroll, n)
     end
   end
-  -- touch monitors get a master switch and the default-timer selector;
-  -- settings live on the terminal
-  if monColor then
-    local label = "[ Toggle All ]"
-    mon.setTextColor(colors.yellow)
-    mon.setCursorPos(math.max(1, math.floor((w - #label) / 2) + 1), h - 1)
-    mon.write(truncate(label, w))
-    monToggleAllY = h - 1
-    label = "[ Timer: " .. timerModeLabel() .. " ]"
-    mon.setTextColor(colors.cyan)
-    mon.setCursorPos(math.max(1, math.floor((w - #label) / 2) + 1), h)
-    mon.write(truncate(label, w))
-    mon.setTextColor(colors.white)
-    monTimerY = h
+  if m.color then drawControlRows(m, w, h) end
+end
+
+local function drawUtilMonRaw()
+  local m = monUtil
+  local d = m.dev
+  m.rowMap, m.cells = {}, {}
+  local _, nUtil = countItems()
+  fitScale(m, 8, function(cols)
+    local ncol = (cols >= MIN_TWOCOL_W) and 2 or 1
+    return math.max(3, math.ceil(nUtil / ncol) + 1)
+  end)
+  local ok, w, h = pcall(d.getSize)
+  if not ok or type(w) ~= "number" then return end
+  if m.color then
+    d.setTextColor(colors.white)
+    d.setBackgroundColor(colors.black)
+  end
+  d.clear()
+  if w < 8 or h < 3 then
+    d.setCursorPos(1, 1)
+    d.write(truncate("util", w))
+    return
+  end
+  if ui.screen ~= "main" then
+    drawNoticeOn(d, w, h)
+    return
+  end
+  drawMonHeading(m, w, m.color and "UTILITIES" or "= UTILITIES =")
+  local listH = math.max(1, h - 1)
+  local utilIdx = {}
+  for i, sp in ipairs(config.spawners) do
+    if isUtility(sp) then utilIdx[#utilIdx + 1] = i end
+  end
+  if #utilIdx == 0 then
+    d.setCursorPos(2, 2)
+    d.write(truncate("(no utilities)", w - 1))
+    return
+  end
+  local need = math.ceil(#utilIdx / #utilColumns(w))
+  if need <= listH then
+    drawUtilList(m, utilIdx, 2, listH, w, false)
+  else
+    -- rare: more utility rows than fit, fall back to a scrolled column
+    local n = #utilIdx
+    for row = 1, listH do
+      local p = ui.mainScroll + row
+      if p > n then break end
+      drawSpawnerRow(m, config.spawners[utilIdx[p]], utilIdx[p], 1 + row, w)
+    end
+    drawScrollArrows(m, w, listH, ui.mainScroll, n)
   end
 end
 
 local function drawMonitor()
-  if not mon then return end
-  -- the monitor may be detached mid-draw; the detach event will clean up
-  pcall(drawMonitorRaw)
+  -- either monitor may detach mid-draw; the detach event cleans up
+  if monPrimary.dev then pcall(drawPrimaryRaw) end
+  if monUtil.dev then pcall(drawUtilMonRaw) end
 end
 
 local function redraw()
@@ -1041,7 +1266,7 @@ local function buildSettingsItems()
   for i, sp in ipairs(config.spawners) do
     items[#items + 1] = { kind = "spawner", index = i, label = sp.name }
   end
-  items[#items + 1] = { kind = "add", label = "[ Add spawner ]" }
+  items[#items + 1] = { kind = "add", label = "[ Add item ]" }
   items[#items + 1] = { kind = "integrators", label = "[ Manage integrators ]" }
   items[#items + 1] = {
     kind = "headercolor",
@@ -1058,6 +1283,7 @@ local function buildEditItems()
   end
   return {
     { kind = "rename", label = "Name: " .. sp.name },
+    { kind = "itemtype", label = "Type: " .. (sp.itemType == "utility" and "Utility" or "Spawner") },
     { kind = "target", label = "Target: " .. targetLabel(sp.target) },
     { kind = "side", label = "Side: " .. sp.side, dim = (sp.target == "none") },
     { kind = "inverted", label = "Inverted: " .. (sp.inverted and "yes" or "no") },
@@ -1065,10 +1291,9 @@ local function buildEditItems()
       .. ((sp.interval or 0) > 0 and (sp.interval .. "s on / " .. sp.interval .. "s off") or "off") },
     { kind = "ignoretimer", label = "Ignore timer: " .. (sp.ignoreTimer and "yes" or "no") },
     { kind = "bypassall", label = "Bypass Toggle All: " .. (sp.bypassAll and "yes" or "no") },
-    { kind = "pos", label = "Menu position: " .. (sp.pos == "bottom" and "Bottom" or "Top") },
     { kind = "moveup", label = "[ Move up ]" },
     { kind = "movedown", label = "[ Move down ]" },
-    { kind = "remove", label = "[ Remove spawner ]" },
+    { kind = "remove", label = "[ Remove item ]" },
     { kind = "back", label = "[ Back ]" },
   }
 end
@@ -1313,7 +1538,7 @@ local function toggleAll()
   end
   if #affected == 0 then
     if #config.spawners > 0 then
-      ui.status = "every spawner bypasses Toggle All"
+      ui.status = "every item bypasses Toggle All"
       redraw()
     end
     return
@@ -1341,7 +1566,7 @@ local function toggleAll()
   end
   ensureTick()
   saveConfig()
-  ui.status = newState and "all spawners ON" or "all spawners OFF"
+  ui.status = newState and "all items ON" or "all items OFF"
   redraw()
 end
 
@@ -1432,24 +1657,24 @@ local function activate(it)
     -- new spawners start unassigned so adding one never flips a face of
     -- the computer that might already be wired to something
     table.insert(config.spawners, {
-      name = "Spawner " .. tostring(#config.spawners + 1),
+      name = "Item " .. tostring(#config.spawners + 1),
       target = "none",
       side = "none",
       inverted = false,
       state = false,
       ignoreTimer = false,
       bypassAll = false,
-      pos = "top",
+      itemType = "spawner",
     })
     saveConfig()
     ui.editIndex = #config.spawners
-    ui.status = "spawner added - set a name and target"
+    ui.status = "item added - set a name, type and target"
     openScreen("edit")
   elseif k == "integrators" then
     openScreen("integrators")
   elseif k == "rename" then
     if sp then
-      openInput("Rename spawner", "New name:", sp.name, function(text)
+      openInput("Rename item", "New name:", sp.name, function(text)
         if text ~= "" then
           sp.name = truncate(text, MAX_NAME_LEN)
           saveConfig()
@@ -1507,9 +1732,12 @@ local function activate(it)
       refreshItems()
       redraw()
     end
-  elseif k == "pos" then
+  elseif k == "itemtype" then
     if sp then
-      sp.pos = (sp.pos == "bottom") and "top" or "bottom"
+      -- utilities group below spawners; drop the obsolete pos field so it
+      -- can never contradict the type
+      sp.itemType = (sp.itemType == "utility") and "spawner" or "utility"
+      sp.pos = nil
       saveConfig()
       refreshItems()
       redraw()
@@ -1532,7 +1760,7 @@ local function activate(it)
     end
   elseif k == "remove" then
     if sp then
-      openConfirm("Remove spawner",
+      openConfirm("Remove item",
         { "Remove \"" .. sp.name .. "\"?", "Its output will be turned off." },
         {
           { label = "Remove", fn = function()
@@ -1551,7 +1779,7 @@ local function activate(it)
                 ui.mainSel = math.max(1, #config.spawners)
               end
               ui.editIndex = nil
-              ui.status = "spawner removed"
+              ui.status = "item removed"
               openScreen("settings")
             end },
           { label = "Cancel", fn = function() openScreen("edit") end },
@@ -1624,7 +1852,7 @@ local function activate(it)
       -- never leave dangling references: removal reassigns the affected
       -- spawners to an explicit unassigned state, off
       openConfirm("Integrator is in use",
-        { "\"" .. name .. "\" is used by " .. tostring(#users) .. " spawner(s)." },
+        { "\"" .. name .. "\" is used by " .. tostring(#users) .. " item(s)." },
         {
           { label = "Turn them off, unassign, and remove", fn = function()
               for _, s in ipairs(users) do
@@ -1638,7 +1866,7 @@ local function activate(it)
               end
               removeIntegratorByName(name)
               saveConfig()
-              ui.status = "removed; spawners set to unassigned"
+              ui.status = "removed; items set to unassigned"
               openScreen("integrators")
             end },
           { label = "Cancel", fn = function() openScreen("integrators") end },
@@ -1737,7 +1965,7 @@ local function handleMenuKey(code)
     -- convenience: space also flips yes/no style fields when selected
     local it = ui.items[ui.sel]
     if it and (it.kind == "inverted" or it.kind == "ignoretimer"
-      or it.kind == "bypassall" or it.kind == "pos") then
+      or it.kind == "bypassall" or it.kind == "itemtype") then
       activate(it)
     end
   end
@@ -1808,13 +2036,30 @@ local function handleChar(ch)
   end
 end
 
+-- which item, if any, sits under (x, y) on monitor m: full-width rows
+-- first, then the two-column utility hitboxes
+local function monHitIndex(m, x, y)
+  if m.rowMap[y] then return m.rowMap[y] end
+  for _, c in ipairs(m.cells) do
+    if c.y == y and x >= c.x1 and x <= c.x2 then return c.index end
+  end
+  return nil
+end
+
 local function handleTouch(name, x, y)
-  if name ~= monName then return end
   if ui.screen ~= "main" then
-    -- the monitor shows a notice while settings are open; ignore taps
+    -- monitors show a notice while settings are open; ignore taps
     return
   end
-  local i = monRowMap[y]
+  local m
+  if name == monPrimary.name then
+    m = monPrimary
+  elseif name == monUtil.name then
+    m = monUtil
+  else
+    return
+  end
+  local i = monHitIndex(m, x, y)
   if i and config.spawners[i] then
     -- move the terminal selection too so both displays stay in step
     for p, ci in ipairs(displayOrder()) do
@@ -1827,17 +2072,18 @@ local function handleTouch(name, x, y)
     toggleSpawner(i)
     return
   end
-  if monToggleAllY and y == monToggleAllY then
+  -- control rows only exist on the primary monitor
+  if m.toggleAllY and y == m.toggleAllY then
     toggleAll()
     return
   end
-  if monTimerY and y == monTimerY then
+  if m.timerY and y == m.timerY then
     cycleTimerMode()
   end
 end
 
 local function onPeripheralChange()
-  findMonitor()
+  findMonitors()
   -- reapply everything: a reattached integrator comes back with its
   -- outputs reset, and the pcall failures refresh each spawner's
   -- offline flag
@@ -1873,7 +2119,7 @@ local function eventLoop()
     elseif ev == "peripheral" or ev == "peripheral_detach" then
       onPeripheralChange()
     elseif ev == "monitor_resize" then
-      findMonitor()
+      findMonitors()
       redraw()
     elseif ev == "term_resize" then
       if ui.screen == "main" then clampMainScroll() else clampMenuScroll() end
@@ -1899,7 +2145,7 @@ local function main()
     end
   end
   ensureTick()
-  findMonitor()
+  findMonitors()
   -- a reboot clears every redstone output, so restore each saved state
   -- before drawing anything; this restore is why the file is "startup"
   applyAll()
@@ -1919,16 +2165,18 @@ term.setCursorPos(1, 1)
 -- setCursorBlink is core term api in every cc version; pcall just in case
 pcall(term.setCursorBlink, true)
 
-if mon then
-  pcall(function()
-    if monColor then
-      mon.setBackgroundColor(colors.black)
-      mon.setTextColor(colors.white)
-    end
-    mon.clear()
-    mon.setCursorPos(1, 1)
-    mon.write("panel stopped")
-  end)
+for _, m in ipairs({ monPrimary, monUtil }) do
+  if m.dev then
+    pcall(function()
+      if m.color then
+        m.dev.setBackgroundColor(colors.black)
+        m.dev.setTextColor(colors.white)
+      end
+      m.dev.clear()
+      m.dev.setCursorPos(1, 1)
+      m.dev.write("panel stopped")
+    end)
+  end
 end
 
 if not ok then
