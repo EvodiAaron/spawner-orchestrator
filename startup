@@ -285,6 +285,28 @@ local function headerStyle()
   return colors.blue, colors.white
 end
 
+-- header/title text is configurable so the panel can front a machine
+-- array (or anything else) rather than only spawners. each getter falls
+-- back to its default so an older config missing the field still reads
+local DEFAULT_TITLE_TEXT = "Spawner Control Panel"
+local DEFAULT_SPAWNER_HEADER = "SPAWNERS"
+local DEFAULT_UTIL_HEADER = "UTILITIES"
+
+local function titleText()
+  local t = config and config.titleText
+  return (t and t ~= "") and t or DEFAULT_TITLE_TEXT
+end
+
+local function spawnerHeaderText()
+  local t = config and config.spawnerHeader
+  return (t and t ~= "") and t or DEFAULT_SPAWNER_HEADER
+end
+
+local function utilHeaderText()
+  local t = config and config.utilHeader
+  return (t and t ~= "") and t or DEFAULT_UTIL_HEADER
+end
+
 -- user label for an integrator, with the peripheral name kept visible
 local function integLabel(name)
   local l = config.integratorLabels and config.integratorLabels[name]
@@ -334,6 +356,9 @@ local function defaultConfig()
     integratorLabels = {},
     timerMode = 0,
     headerColor = "blue",
+    titleText = DEFAULT_TITLE_TEXT,
+    spawnerHeader = DEFAULT_SPAWNER_HEADER,
+    utilHeader = DEFAULT_UTIL_HEADER,
   }
 end
 
@@ -371,6 +396,10 @@ local function validConfig(c)
   if c.timerMode ~= nil and type(c.timerMode) ~= "number" then return false end
   -- optional field: header bar colour name
   if c.headerColor ~= nil and type(c.headerColor) ~= "string" then return false end
+  -- optional fields: custom header/title text
+  if c.titleText ~= nil and type(c.titleText) ~= "string" then return false end
+  if c.spawnerHeader ~= nil and type(c.spawnerHeader) ~= "string" then return false end
+  if c.utilHeader ~= nil and type(c.utilHeader) ~= "string" then return false end
   -- optional field: user labels for integrators, keyed by peripheral name
   if c.integratorLabels ~= nil then
     if type(c.integratorLabels) ~= "table" then return false end
@@ -727,7 +756,7 @@ local function drawTermMain()
     return
   end
   clampMainScroll()
-  drawTitleBar(t, w, "Spawner Control Panel")
+  drawTitleBar(t, w, titleText())
   local listH = termMainListH()
   local n = #config.spawners
   local anyOffline = false
@@ -1198,7 +1227,7 @@ local function drawPrimaryRaw(m)
     drawNoticeOn(d, w, h)
     return
   end
-  drawMonHeading(m, w, m.color and "SPAWNERS" or "= SPAWNERS =")
+  drawMonHeading(m, w, m.color and spawnerHeaderText() or ("= " .. spawnerHeaderText() .. " ="))
   -- list area = everything but the heading and (on touch monitors) the
   -- one or two control rows; basic monitors have no controls
   local ctrlRows = m.color and primaryCtrlRows(w) or 0
@@ -1284,7 +1313,7 @@ local function drawUtilMonRaw(m)
     drawNoticeOn(d, w, h)
     return
   end
-  drawMonHeading(m, w, m.color and "UTILITIES" or "= UTILITIES =")
+  drawMonHeading(m, w, m.color and utilHeaderText() or ("= " .. utilHeaderText() .. " ="))
   local listH = math.max(1, h - 1)
   local utilIdx = {}
   for i, sp in ipairs(config.spawners) do
@@ -1349,6 +1378,9 @@ local function buildSettingsItems()
     kind = "headercolor",
     label = "[ Header colour: " .. (config.headerColor or "blue") .. " ]",
   }
+  items[#items + 1] = { kind = "titletext", label = "[ Panel title: " .. titleText() .. " ]" }
+  items[#items + 1] = { kind = "spawnerheader", label = "[ Main header: " .. spawnerHeaderText() .. " ]" }
+  items[#items + 1] = { kind = "utilheader", label = "[ Utilities header: " .. utilHeaderText() .. " ]" }
   items[#items + 1] = { kind = "back", label = "[ Back ]" }
   return items
 end
@@ -1983,6 +2015,23 @@ local function activate(it)
     openScreen("main")
   elseif k == "headercolor" then
     openScreen("pick_color")
+  elseif k == "titletext" then
+    openInput("Panel title", "Terminal title:", config.titleText or DEFAULT_TITLE_TEXT, function(text)
+      config.titleText = truncate(text, MAX_INPUT_LEN)
+      saveConfig()
+    end, "settings")
+  elseif k == "spawnerheader" then
+    openInput("Main header", "Spawner monitor header:", config.spawnerHeader or DEFAULT_SPAWNER_HEADER,
+      function(text)
+        config.spawnerHeader = truncate(text, MAX_INPUT_LEN)
+        saveConfig()
+      end, "settings")
+  elseif k == "utilheader" then
+    openInput("Utilities header", "Utilities monitor header:", config.utilHeader or DEFAULT_UTIL_HEADER,
+      function(text)
+        config.utilHeader = truncate(text, MAX_INPUT_LEN)
+        saveConfig()
+      end, "settings")
   elseif k == "coloropt" then
     config.headerColor = it.value
     saveConfig()

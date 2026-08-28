@@ -141,6 +141,12 @@ Each spawner's settings screen also offers:
 The header bar colour on both displays is selectable in settings
 (**Header colour**), with a picker that previews each colour.
 
+The header and title text is editable in settings so the panel can front
+anything the redstone outputs drive — a machine array, a farm, a factory
+line — not just spawners: **Panel title** (the terminal header), **Main
+header** (the spawner-monitor heading), and **Utilities header** (the
+utilities-monitor heading). Clearing a field restores its default.
+
 ## Persistence
 
 State lives in `config` next to the program and is saved after every
