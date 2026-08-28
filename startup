@@ -17,10 +17,10 @@
 --   * optional: an advanced monitor for a touch panel. place it
 --     touching the computer or connect it over wired modems. a basic
 --     monitor also works but is display-only (no touch).
---   * optional: a second monitor. when one is present the utilities
---     move onto it and the first monitor shows only the spawners. the
---     two lowest-named monitors are used (first = spawners, second =
---     utilities)
+--   * optional: extra monitors. sorted by name, roles alternate: the
+--     1st shows spawners, the 2nd the utilities, the 3rd spawners, the
+--     4th utilities, and so on, so a third and fourth monitor repeat the
+--     pair. with a lone monitor the spawners and utilities share it
 --   * optional: plethora redstone integrators for spawners that are
 --     not adjacent to the computer itself
 --
@@ -51,7 +51,7 @@
 --   dimmed and, to save vertical space, two per row where width allows.
 --   [ Toggle All ] and [ Timer: ... ] share one bottom row on wide
 --   monitors and stack on narrow ones. a dedicated utilities monitor
---   renders no larger than the spawner monitor.
+--   renders no larger than the first spawner monitor.
 --
 -- per-item options (settings -> item): item type spawner/utility
 --   (utilities are grouped below the spawners and anchor above the
@@ -180,22 +180,26 @@ local tickTimerId = nil
 local intervalPhase = {}
 local intervalNext = {}
 
--- monitor state. two monitors are driven: monPrimary shows the spawner
--- list plus the touch control rows, and (when it is the only monitor)
--- the utilities as well. monUtil, present only when a second monitor is
--- attached, shows the utilities instead so they never crowd the spawners.
+-- monitor state. every attached monitor is driven, sorted by name with
+-- roles alternating: 1st shows spawners, 2nd the utilities, 3rd spawners,
+-- 4th utilities, and so on, so extra monitors mirror the pair. a lone
+-- monitor is a spawner display that also carries the utilities. a
+-- "primary" (spawner) descriptor draws the touch control rows; a "util"
+-- descriptor draws only the utilities so they never crowd the spawners.
 -- each descriptor rebuilds its hit maps on every draw:
+--   role    "primary" (spawners + controls) or "util" (utilities only)
 --   rowMap  monitor y -> config.spawners index for full-width rows
 --   cells   two-column utility hitboxes: { { y, x1, x2, index }, ... }
 --   toggleAllBtn / timerBtn  control-button hitboxes { y, x1, x2 }
-local monPrimary = {
-  dev = nil, name = nil, color = false, scale = 1,
-  rowMap = {}, cells = {}, toggleAllBtn = nil, timerBtn = nil,
-}
-local monUtil = {
-  dev = nil, name = nil, color = false, scale = 1,
-  rowMap = {}, cells = {},
-}
+local function newMonDesc()
+  return {
+    dev = nil, name = nil, color = false, scale = 1, role = "primary",
+    rowMap = {}, cells = {}, toggleAllBtn = nil, timerBtn = nil,
+  }
+end
+
+-- ordered list of attached-monitor descriptors, rebuilt by findMonitors
+local monitors = {}
 
 local ui = {
   screen = "main", -- main|settings|edit|pick_target|pick_side|integrators|scan|confirm|input
@@ -588,10 +592,12 @@ local function detachMonitor(m)
   m.scale = 1
 end
 
--- assign attached monitors to roles. the two lowest-named monitors win:
--- the first is the primary (spawners + controls), the second, if any,
--- becomes the dedicated utilities monitor. sorting by name keeps a given
--- physical monitor in the same role across rescans
+-- assign attached monitors to alternating roles: sorted by name, every
+-- odd monitor (1st, 3rd, ...) is a primary (spawners + controls) and
+-- every even one (2nd, 4th, ...) is a utilities display, so a third and
+-- fourth monitor repeat the spawners/utilities pair. sorting by name
+-- keeps a given physical monitor in the same slot across rescans, so its
+-- chosen scale survives (attachMonitor only resets scale on a new name)
 local function findMonitors()
   local list = {}
   peripheral.find("monitor", function(name, dev)
@@ -599,10 +605,32 @@ local function findMonitors()
     return false
   end)
   table.sort(list, function(a, b) return a.name < b.name end)
-  if list[1] then attachMonitor(monPrimary, list[1].dev, list[1].name)
-  else detachMonitor(monPrimary) end
-  if list[2] then attachMonitor(monUtil, list[2].dev, list[2].name)
-  else detachMonitor(monUtil) end
+  for i, entry in ipairs(list) do
+    monitors[i] = monitors[i] or newMonDesc()
+    monitors[i].role = (i % 2 == 1) and "primary" or "util"
+    attachMonitor(monitors[i], entry.dev, entry.name)
+  end
+  -- drop descriptors for monitors that are no longer attached
+  for i = #monitors, #list + 1, -1 do
+    detachMonitor(monitors[i])
+    monitors[i] = nil
+  end
+end
+
+-- the first attached spawner monitor, whose scale caps the utilities
+local function firstPrimaryMon()
+  for _, m in ipairs(monitors) do
+    if m.dev and m.role == "primary" then return m end
+  end
+  return nil
+end
+
+-- whether any attached monitor is a dedicated utilities display
+local function anyUtilMon()
+  for _, m in ipairs(monitors) do
+    if m.dev and m.role == "util" then return true end
+  end
+  return false
 end
 
 local function removeIntegratorByName(name)
@@ -1138,13 +1166,12 @@ local function drawControlRows(m, w, h)
   end
 end
 
-local function drawPrimaryRaw()
-  local m = monPrimary
+local function drawPrimaryRaw(m)
   local d = m.dev
   m.rowMap, m.cells = {}, {}
   m.toggleAllBtn, m.timerBtn = nil, nil
   local nSp, nUtil = countItems()
-  local hasUtilMon = monUtil.dev ~= nil
+  local hasUtilMon = anyUtilMon()
   -- fit the scale to exactly what this monitor will hold - heading, the
   -- list itself, and the control rows - with no wasted row, so a dense
   -- list (e.g. ~16 spawners) renders at the largest text that still fits.
@@ -1230,17 +1257,17 @@ local function drawPrimaryRaw()
   if m.color then drawControlRows(m, w, h) end
 end
 
-local function drawUtilMonRaw()
-  local m = monUtil
+local function drawUtilMonRaw(m)
   local d = m.dev
   m.rowMap, m.cells = {}, {}
   local _, nUtil = countItems()
   -- keep utilities no larger than the spawner monitor (drawn first, so
   -- its scale is current); dimming already marks them as secondary
+  local primary = firstPrimaryMon()
   fitScale(m, 8, function(cols)
     local ncol = (cols >= MIN_TWOCOL_W) and 2 or 1
     return math.max(3, math.ceil(nUtil / ncol) + 1)
-  end, monPrimary.scale)
+  end, primary and primary.scale or nil)
   local ok, w, h = pcall(d.getSize)
   if not ok or type(w) ~= "number" then return end
   if m.color then
@@ -1284,9 +1311,15 @@ local function drawUtilMonRaw()
 end
 
 local function drawMonitor()
-  -- either monitor may detach mid-draw; the detach event cleans up
-  if monPrimary.dev then pcall(drawPrimaryRaw) end
-  if monUtil.dev then pcall(drawUtilMonRaw) end
+  -- any monitor may detach mid-draw; the detach event cleans up. draw the
+  -- spawner monitors first so their scale is settled before the utility
+  -- monitors cap themselves to it
+  for _, m in ipairs(monitors) do
+    if m.dev and m.role == "primary" then pcall(drawPrimaryRaw, m) end
+  end
+  for _, m in ipairs(monitors) do
+    if m.dev and m.role == "util" then pcall(drawUtilMonRaw, m) end
+  end
 end
 
 local function redraw()
@@ -2100,13 +2133,13 @@ local function handleTouch(name, x, y)
     return
   end
   local m
-  if name == monPrimary.name then
-    m = monPrimary
-  elseif name == monUtil.name then
-    m = monUtil
-  else
-    return
+  for _, mon in ipairs(monitors) do
+    if mon.dev and mon.name == name then
+      m = mon
+      break
+    end
   end
+  if not m then return end
   local i = monHitIndex(m, x, y)
   if i and config.spawners[i] then
     -- move the terminal selection too so both displays stay in step
@@ -2214,7 +2247,7 @@ term.setCursorPos(1, 1)
 -- setCursorBlink is core term api in every cc version; pcall just in case
 pcall(term.setCursorBlink, true)
 
-for _, m in ipairs({ monPrimary, monUtil }) do
+for _, m in ipairs(monitors) do
   if m.dev then
     pcall(function()
       if m.color then
